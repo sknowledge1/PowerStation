@@ -301,23 +301,43 @@ fn select_backend(
             "hardware curve backend requested but no auto-point attributes exist".into(),
         )),
         (BackendPreference::HardwareCurve, Some(points)) => {
-            if config.mode_values.hardware_curve.is_none() {
-                return Err(DiscoveryError(
-                    "hardware curve attributes exist but no enable value is configured".into(),
-                ));
-            }
+            hardware_policy_supported(config, points.len())?;
             Ok(BackendKind::HardwareCurve(points))
         }
         (BackendPreference::Auto, Some(points)) => {
-            if config.mode_values.hardware_curve.is_none() {
-                return Err(DiscoveryError(
-                    "hardware curve attributes exist but no enable value is configured".into(),
-                ));
+            if let Err(reason) = hardware_policy_supported(config, points.len()) {
+                log::debug!("Fan {} uses software curves: {reason}", config.id);
+                return Ok(BackendKind::SoftwareCurve);
             }
             Ok(BackendKind::HardwareCurve(points))
         }
         (BackendPreference::Auto, None) => Ok(BackendKind::SoftwareCurve),
     }
+}
+
+fn hardware_policy_supported(config: &FanConfig, point_count: usize) -> Result<(), DiscoveryError> {
+    if config.mode_values.hardware_curve.is_none() {
+        return Err(DiscoveryError(
+            "no hardware curve enable value is configured".into(),
+        ));
+    }
+    // A continuously interpolated hardware curve cannot express the software
+    // controller's fan-stop hysteresis or its jump to the running floor.
+    if config.limits.minimum_percent < config.limits.minimum_running_percent {
+        return Err(DiscoveryError(
+            "hardware curves require a nonzero minimum at or above the running floor; use software curves for fan-stop hysteresis".into(),
+        ));
+    }
+    if config
+        .presets
+        .values()
+        .any(|points| points.len() != point_count)
+    {
+        return Err(DiscoveryError(format!(
+            "hardware presets must contain exactly {point_count} points"
+        )));
+    }
+    Ok(())
 }
 
 fn driver_name(hwmon: &Path) -> Option<String> {
@@ -543,9 +563,63 @@ mod tests {
                 &format!("{}\n", index * 50),
             );
         }
-        let paths = discover_fan(tree.path(), &config()).unwrap();
+        let mut config = config();
+        config.limits.minimum_percent = config.limits.minimum_running_percent;
+        let paths = discover_fan(tree.path(), &config).unwrap();
         assert_eq!(paths.backend.curve_point_count(), 3);
         assert_eq!(paths.backend.name(), "hardware_curve");
+    }
+
+    #[test]
+    fn auto_falls_back_for_unsupported_policy_and_explicit_hardware_rejects_it() {
+        let points = vec![
+            HardwareCurvePointPaths {
+                index: 1,
+                temperature: "temp1".into(),
+                pwm: "pwm1".into(),
+            },
+            HardwareCurvePointPaths {
+                index: 2,
+                temperature: "temp2".into(),
+                pwm: "pwm2".into(),
+            },
+        ];
+        let mut config = config();
+        assert_eq!(
+            select_backend(&config, Some(points.clone())).unwrap(),
+            BackendKind::SoftwareCurve
+        );
+        config.backend = BackendPreference::HardwareCurve;
+        assert!(select_backend(&config, Some(points.clone())).is_err());
+        config.backend = BackendPreference::Auto;
+        config.limits.minimum_percent = 10;
+        config.presets.insert(
+            "Quiet".into(),
+            vec![
+                super::super::config::CurvePoint {
+                    temperature_c: 45.0,
+                    percent: 10,
+                },
+                super::super::config::CurvePoint {
+                    temperature_c: 70.0,
+                    percent: 30,
+                },
+                super::super::config::CurvePoint {
+                    temperature_c: 95.0,
+                    percent: 100,
+                },
+            ],
+        );
+        assert_eq!(
+            select_backend(&config, Some(points.clone())).unwrap(),
+            BackendKind::SoftwareCurve
+        );
+        config.presets.clear();
+        config.mode_values.hardware_curve = None;
+        assert_eq!(
+            select_backend(&config, Some(points)).unwrap(),
+            BackendKind::SoftwareCurve
+        );
     }
 
     #[test]

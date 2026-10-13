@@ -81,6 +81,8 @@
 
 #### EnumerateFans
 
+Return fan object paths selected by the platform database; an unsupported system returns an empty list.
+
 ##### Arguments
 
 | Name | Direction | Type | Description |

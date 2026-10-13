@@ -36,6 +36,9 @@
     </method>
   </interface>
   <interface name="org.shadowblip.Fan">
+    <!--
+     Return fan object paths selected by the platform database; an unsupported system returns an empty list.
+     -->
     <method name="EnumerateFans">
       <arg type="ao" direction="out"/>
     </method>

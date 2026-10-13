@@ -70,6 +70,15 @@ run: debug ## Build and run
 test: debug ## Build and run all tests
 	cargo test -- --show-output
 
+FAN_TEST_BINARY ?= target/$(TARGET_ARCH)/debug/powerstation
+FAN_TEST_LOGIND ?= target/$(TARGET_ARCH)/debug/examples/fan_test_logind
+.PHONY: test-fan-lifecycle-build test-fan-lifecycle
+test-fan-lifecycle-build: ## Build the daemon and private logind lifecycle fixture
+	cargo build --locked --target $(TARGET_ARCH) --bin powerstation --example fan_test_logind
+
+test-fan-lifecycle: ## Run isolated fan lifecycle tests using the user systemd manager
+	python3 tests/fan_lifecycle.py $(FAN_TEST_BINARY) $(FAN_TEST_LOGIND)
+
 .PHONY: clean
 clean: ## Remove build artifacts
 	rm -rf target

@@ -59,7 +59,13 @@ devices:
 uses a software curve when only one PWM control is present. A complete,
 contiguous set of `pwmN_auto_pointX_temp` and `pwmN_auto_pointX_pwm` attributes
 can use the hardware backend only when `hardware_curve` supplies the documented
-driver mode value. Partial point sets are rejected.
+driver mode value, `minimum_percent` is at least `minimum_running_percent`, and
+every preset contains exactly the native point count. Hardware curves cannot
+implement the software fan-stop hysteresis or its discontinuous running floor.
+Auto uses software control for those policies or for missing hardware mode
+values. An explicit `hardware_curve` request rejects unsupported policy.
+Partial point sets are rejected. Custom hardware curves must also contain
+exactly the native point count; points are never silently resampled.
 
 Mode values, PWM range and quantization tolerance, write order, temperature
 limits, hysteresis, RPM limits, and presets are hardware facts or policies that
@@ -72,15 +78,26 @@ DMI and `ayaneo_ec` interface are shared across the product family. Its 95 C
 full-speed and 98 C firmware-handoff values remain proposed policy for maintainer
 review. Hardware validation currently covers the Ryzen 7 8840U model; the Ryzen
 AI 9 HX 370 model is configuration-schema coverage until tested on that device.
+Driver evidence, the basis and limits of the proposed policy, and reproducible
+validation commands are recorded in [Fan validation](fan-validation.md).
 
 On a discovery, telemetry, ownership, readback, stall, lifecycle, or watchdog
 fault, PowerStation restores the configured automatic mode. Before suspend it
-uses logind's delay inhibitor to verify the same handoff, then rediscovers paths
-and restores saved control after resume. If the automatic-mode handoff fails,
-PowerStation retains the inhibitor until systemd's watchdog terminates the
-service and `ExecStopPost` runs the independent recovery command. Loss or
-replacement of logind's D-Bus owner also makes the service unhealthy and forces
-an automatic-mode fallback.
+uses logind's delay inhibitor to attempt a verified handoff, then rediscovers
+paths and restores saved control after resume. Custom configuration calls are
+blocked before the handoff starts and remain blocked until lifecycle protection
+is ready again. The selected mode is retained during a successful suspend,
+while `Controlling` and `TelemetryValid` are false.
+
+Failed handoffs retry within the reported `InhibitDelayMaxUSec` budget, with
+blocking sysfs work kept off the asynchronous runtime. Expiry or failure makes
+the service unhealthy and prevents further custom control. A timeout cannot
+cancel a blocked kernel operation; a late worker can only restore automatic
+mode. The watchdog and `ExecStopPost` provide additional best-effort recovery.
+A delay inhibitor expires and is released when its process dies, so neither
+holding it nor the post-stop helper guarantees completion before sleep. Loss
+or replacement of logind's D-Bus owner also makes the service unhealthy and
+forces automatic fallback.
 
 The recovery command repeats the exact DMI match and fan hwmon name, parent
 driver, and channel match, but intentionally does not require temperature, RPM,
@@ -90,6 +107,11 @@ caused the service to exit, without widening the set of writable devices.
 
 Isolated lifecycle tests can redirect every fan-controlled path with
 `POWERSTATION_FAN_PLATFORM_DIR`, `POWERSTATION_FAN_SYSFS_ROOT`,
-`POWERSTATION_FAN_STATE_PATH`, and `POWERSTATION_FAN_LEGACY_STATE_PATH`. These
+and `POWERSTATION_FAN_STATE_PATH`. These
 variables are intentionally absent from the packaged systemd unit; normal service
 runs use the packaged platform database, real sysfs, and persistent system state.
+
+Only PowerStation's own saved selections are restored. Import of third-party
+AYANEO daemon state is deferred; first use remains in firmware Automatic.
+An existing fan daemon must be stopped before enabling custom control because
+two writers using the same manual mode cannot be distinguished by mode readback.

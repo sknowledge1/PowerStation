@@ -54,6 +54,7 @@ Individual interface documentation can be found here:
 * [org.shadowblip.Fan](./docs/fan.md)
 * [org.shadowblip.Fan.Device](./docs/fan-device.md)
 * [Fan platform YAML](./docs/fan-platform-yaml.md)
+* [Fan validation](./docs/fan-validation.md)
 
 ## Usage
 

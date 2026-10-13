@@ -1,8 +1,22 @@
 name: 🪲 Test
 
-on: [push]
+on: [push, pull_request]
 
 jobs:
+  fan-lifecycle:
+    name: Run isolated fan lifecycle tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libpci3 dbus-daemon dbus-user-session
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          make in-docker TARGET='test-fan-lifecycle-build'
+          make test-fan-lifecycle
+
   run-tests:
     name: Run tests
     runs-on: ubuntu-latest

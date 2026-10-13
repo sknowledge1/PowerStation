@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -57,10 +57,6 @@ pub struct SavedFanState {
     pub preset: Option<String>,
 }
 
-fn default_manual_percent() -> u8 {
-    50
-}
-
 impl Default for SavedFanState {
     fn default() -> Self {
         Self {
@@ -87,11 +83,6 @@ impl Default for StateFile {
             fans: BTreeMap::new(),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyAy3State {
-    mode: Option<String>,
 }
 
 #[derive(Clone)]
@@ -135,54 +126,10 @@ impl StateStore {
             .unwrap_or_default()
     }
 
-    pub fn contains(&self, key: &str) -> bool {
-        self.state
-            .lock()
-            .expect("fan state lock poisoned")
-            .fans
-            .contains_key(key)
-    }
-
     pub fn set(&self, key: &str, mode: SavedFanState) -> Result<(), PersistenceError> {
         let mut state = self.state.lock().expect("fan state lock poisoned");
         state.fans.insert(key.to_string(), mode);
         self.save_locked(&state)
-    }
-
-    pub fn migrate_legacy_quiet(
-        &self,
-        key: &str,
-        legacy_path: &Path,
-        quiet_available: bool,
-    ) -> Result<bool, PersistenceError> {
-        if self.contains(key) || !quiet_available || !legacy_path.exists() {
-            return Ok(false);
-        }
-        let raw = fs::read_to_string(legacy_path).map_err(|error| {
-            PersistenceError(format!(
-                "unable to read legacy fan state {}: {error}",
-                legacy_path.display()
-            ))
-        })?;
-        let legacy: LegacyAy3State = serde_json::from_str(&raw).map_err(|error| {
-            PersistenceError(format!(
-                "invalid legacy fan state {}: {error}",
-                legacy_path.display()
-            ))
-        })?;
-        if legacy.mode.as_deref() != Some("quiet") {
-            return Ok(false);
-        }
-        self.set(
-            key,
-            SavedFanState {
-                mode: SavedMode::Preset,
-                manual_percent: 15,
-                curve: Vec::new(),
-                preset: Some("Quiet".into()),
-            },
-        )?;
-        Ok(true)
     }
 
     fn save_locked(&self, state: &StateFile) -> Result<(), PersistenceError> {
@@ -234,6 +181,10 @@ impl StateStore {
     }
 }
 
+fn default_manual_percent() -> u8 {
+    50
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,34 +228,6 @@ mod tests {
             }
         );
         assert!(!root.join("fan-state.yaml.tmp").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_quiet_migrates_once_to_named_preset() {
-        let root = temporary_directory();
-        let legacy = root.join("config.json");
-        fs::write(
-            &legacy,
-            r#"{"mode":"quiet","percent":15,"curve":[10,30,40,70,100]}"#,
-        )
-        .unwrap();
-        let state = StateStore::open(root.join("fan-state.yaml")).unwrap();
-        assert!(state
-            .migrate_legacy_quiet("ayaneo-3/system", &legacy, true)
-            .unwrap());
-        assert_eq!(
-            state.get("ayaneo-3/system"),
-            SavedFanState {
-                mode: SavedMode::Preset,
-                manual_percent: 15,
-                curve: Vec::new(),
-                preset: Some("Quiet".into())
-            }
-        );
-        assert!(!state
-            .migrate_legacy_quiet("ayaneo-3/system", &legacy, true)
-            .unwrap());
         let _ = fs::remove_dir_all(root);
     }
 }

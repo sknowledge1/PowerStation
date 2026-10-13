@@ -18,11 +18,9 @@ use zbus::{proxy, Connection};
 const DEFAULT_PLATFORM_DIR: &str = "/usr/share/powerstation/platform";
 const DEFAULT_SYSFS_ROOT: &str = "/sys";
 const DEFAULT_STATE_PATH: &str = "/var/lib/powerstation/fan-state.yaml";
-const LEGACY_AY3_STATE_PATH: &str = "/var/lib/ay3-fancontrol/config.json";
 const PLATFORM_DIR_ENV: &str = "POWERSTATION_FAN_PLATFORM_DIR";
 const SYSFS_ROOT_ENV: &str = "POWERSTATION_FAN_SYSFS_ROOT";
 const STATE_PATH_ENV: &str = "POWERSTATION_FAN_STATE_PATH";
-const LEGACY_STATE_PATH_ENV: &str = "POWERSTATION_FAN_LEGACY_STATE_PATH";
 
 #[derive(Debug)]
 pub struct ManagerError(pub String);
@@ -49,6 +47,9 @@ impl From<ControllerError> for ManagerError {
 trait LoginManager {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
 
+    #[zbus(property)]
+    fn inhibit_delay_max_usec(&self) -> zbus::Result<u64>;
+
     #[zbus(signal)]
     fn prepare_for_sleep(&self, sleeping: bool) -> zbus::Result<()>;
 }
@@ -58,6 +59,7 @@ pub struct FanManager {
     controllers: Vec<(String, Arc<Mutex<FanController>>)>,
     monitor_health: Arc<Vec<StdMutex<Instant>>>,
     sleep_monitor_healthy: Arc<AtomicBool>,
+    custom_control_allowed: Arc<AtomicBool>,
 }
 
 impl FanManager {
@@ -67,6 +69,7 @@ impl FanManager {
             controllers: Vec::new(),
             monitor_health: Arc::new(Vec::new()),
             sleep_monitor_healthy: Arc::new(AtomicBool::new(true)),
+            custom_control_allowed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -75,7 +78,6 @@ impl FanManager {
             platform_directory(),
             configured_path(SYSFS_ROOT_ENV, DEFAULT_SYSFS_ROOT),
             configured_path(STATE_PATH_ENV, DEFAULT_STATE_PATH),
-            configured_path(LEGACY_STATE_PATH_ENV, LEGACY_AY3_STATE_PATH),
         )
     }
 
@@ -83,7 +85,6 @@ impl FanManager {
         platform_dir: PathBuf,
         sysfs_root: PathBuf,
         state_path: PathBuf,
-        legacy_state_path: PathBuf,
     ) -> Result<Self, ManagerError> {
         let devices =
             load_databases(&platform_dir).map_err(|error| ManagerError(error.to_string()))?;
@@ -96,6 +97,7 @@ impl FanManager {
                 controllers: Vec::new(),
                 monitor_health: Arc::new(Vec::new()),
                 sleep_monitor_healthy: Arc::new(AtomicBool::new(true)),
+                custom_control_allowed: Arc::new(AtomicBool::new(false)),
             });
         };
         log::info!(
@@ -116,26 +118,9 @@ impl FanManager {
             }
         };
         let mut controllers = Vec::new();
+        let custom_control_allowed = Arc::new(AtomicBool::new(false));
         for (index, config) in fans.iter().cloned().enumerate() {
-            let key = format!("{device_id}/{}", config.id);
-            let migrated = match store.migrate_legacy_quiet(
-                &key,
-                &legacy_state_path,
-                config.presets.contains_key("Quiet"),
-            ) {
-                Ok(migrated) => migrated,
-                Err(error) => {
-                    return Err(initialization_failure(
-                        error.to_string(),
-                        &sysfs_root,
-                        &fans,
-                    ))
-                }
-            };
-            if migrated {
-                log::info!("Migrated legacy Quiet fan mode for {key}");
-            }
-            let controller = match FanController::new(
+            let mut controller = match FanController::new(
                 device_id.clone(),
                 config,
                 sysfs_root.clone(),
@@ -150,6 +135,7 @@ impl FanManager {
                     ))
                 }
             };
+            controller.set_control_gate(Arc::clone(&custom_control_allowed));
             let path = format!("{FAN_PATH}/Fan{index}");
             controllers.push((path, Arc::new(Mutex::new(controller))));
         }
@@ -159,7 +145,8 @@ impl FanManager {
         Ok(Self {
             controllers,
             monitor_health: Arc::new(monitor_health),
-            sleep_monitor_healthy: Arc::new(AtomicBool::new(true)),
+            sleep_monitor_healthy: Arc::new(AtomicBool::new(false)),
+            custom_control_allowed,
         })
     }
 
@@ -168,6 +155,14 @@ impl FanManager {
     }
 
     pub async fn start(&self) -> Result<(), ManagerError> {
+        let protected = self.sleep_monitor_healthy.load(Ordering::Acquire);
+        self.custom_control_allowed
+            .store(protected, Ordering::Release);
+        if !protected {
+            return Err(ManagerError(
+                "fan sleep protection is unavailable at startup".into(),
+            ));
+        }
         let mut errors = Vec::new();
         for (path, controller) in &self.controllers {
             if let Err(error) = controller.lock().await.start() {
@@ -175,6 +170,10 @@ impl FanManager {
             }
         }
         if errors.is_empty() {
+            self.custom_control_allowed.store(
+                self.sleep_monitor_healthy.load(Ordering::Acquire),
+                Ordering::Release,
+            );
             return Ok(());
         }
         for (_, controller) in &self.controllers {
@@ -183,6 +182,11 @@ impl FanManager {
                 controller.fail_to_automatic("another configured fan failed to start");
             }
         }
+        self.custom_control_allowed.store(
+            self.sleep_monitor_healthy.load(Ordering::Acquire)
+                && self.automatic_fallback_verified().await,
+            Ordering::Release,
+        );
         Err(ManagerError(errors.join("; ")))
     }
 
@@ -301,6 +305,9 @@ impl FanManager {
             };
             log::error!("Fan sleep monitor stopped: {failure}");
             manager
+                .custom_control_allowed
+                .store(false, Ordering::Release);
+            manager
                 .sleep_monitor_healthy
                 .store(false, Ordering::Release);
             manager.fail_all_to_automatic("sleep monitor failure").await;
@@ -315,6 +322,7 @@ impl FanManager {
     }
 
     pub async fn shutdown(&self) -> Result<(), ManagerError> {
+        self.custom_control_allowed.store(false, Ordering::Release);
         let mut errors = Vec::new();
         for (_, controller) in &self.controllers {
             if let Err(error) = controller.lock().await.shutdown() {
@@ -429,6 +437,14 @@ impl FanManager {
             }
         };
         let mut inhibitor = Some(first_inhibitor);
+        let delay = match proxy.inhibit_delay_max_usec().await {
+            Ok(microseconds) => Duration::from_micros(microseconds),
+            Err(error) => {
+                let _ = ready.send(Err(error.to_string()));
+                return Err(ManagerError(error.to_string()));
+            }
+        };
+        self.sleep_monitor_healthy.store(true, Ordering::Release);
         let _ = ready.send(Ok(()));
         loop {
             tokio::select! {
@@ -440,26 +456,13 @@ impl FanManager {
                         .args()
                         .map_err(|error| ManagerError(error.to_string()))?;
                     if *arguments.sleeping() {
-                        let mut errors = Vec::new();
-                        for (_, controller) in &self.controllers {
-                            if let Err(error) = controller.lock().await.prepare_for_sleep() {
-                                errors.push(error.to_string());
-                            }
-                        }
-                        if errors.is_empty() {
+                        self.custom_control_allowed.store(false, Ordering::Release);
+                        if let Err(error) = self.prepare_for_sleep(delay).await {
+                            self.sleep_monitor_healthy.store(false, Ordering::Release);
+                            return Err(error);
+                        } else {
                             log::info!("All fans verified in firmware automatic mode before sleep");
                             inhibitor.take();
-                        } else {
-                            let reason = format!(
-                                "unable to verify firmware automatic mode before sleep: {}",
-                                errors.join("; ")
-                            );
-                            log::error!("{reason}; retaining the delay inhibitor for watchdog recovery");
-                            self.sleep_monitor_healthy.store(false, Ordering::Release);
-                            self.fail_all_to_automatic(&reason).await;
-                            std::future::pending::<()>().await;
-                            drop(inhibitor);
-                            unreachable!();
                         }
                     } else {
                         inhibitor = Some(acquire_inhibitor(&proxy).await?);
@@ -475,6 +478,7 @@ impl FanManager {
                                 }
                             }
                         }
+                        self.custom_control_allowed.store(true, Ordering::Release);
                     }
                 }
                 owner = owner_changes.next() => {
@@ -491,6 +495,7 @@ impl FanManager {
     }
 
     async fn fail_all_to_automatic(&self, reason: &str) {
+        self.custom_control_allowed.store(false, Ordering::Release);
         log::error!("Returning all fans to automatic because of {reason}");
         for (_, controller) in &self.controllers {
             let mut controller = controller.lock().await;
@@ -499,6 +504,38 @@ impl FanManager {
                 "Fan {} entered automatic fallback: {error}",
                 controller.state_key()
             );
+        }
+    }
+
+    async fn prepare_for_sleep(&self, delay: Duration) -> Result<(), ManagerError> {
+        self.custom_control_allowed.store(false, Ordering::Release);
+        let manager = self.clone();
+        let deadline = Instant::now() + delay;
+        // Sysfs calls can block. Keep them off the runtime so the delay budget
+        // and watchdog remain observable; a timed-out worker can only restore
+        // automatic mode, never resume custom control.
+        let handoff = tokio::task::spawn_blocking(move || loop {
+            let mut errors = Vec::new();
+            for (_, controller) in &manager.controllers {
+                if let Err(error) = controller.blocking_lock().prepare_for_sleep() {
+                    errors.push(error.to_string());
+                }
+            }
+            if errors.is_empty() {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ManagerError(errors.join("; ")));
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+        });
+        match tokio::time::timeout(delay, handoff).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(ManagerError(format!("fan suspend handoff task failed: {error}"))),
+            Err(_) => Err(ManagerError(
+                "fan automatic handoff exceeded logind's delay budget; suspend may proceed without verified recovery".into(),
+            )),
         }
     }
 }
@@ -627,7 +664,9 @@ mod tests {
                 StdMutex::new(Instant::now() - Duration::from_secs(10)),
             ]),
             sleep_monitor_healthy: Arc::new(AtomicBool::new(true)),
+            custom_control_allowed: Arc::new(AtomicBool::new(false)),
         };
+        // This fixture tests heartbeat age independently of logind readiness.
         assert!(!manager.watchdog_healthy(Duration::from_secs(3)));
         *manager.monitor_health[1].lock().unwrap() = Instant::now();
         assert!(manager.watchdog_healthy(Duration::from_secs(3)));
@@ -672,14 +711,93 @@ mod tests {
         let platform =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("rootfs/usr/share/powerstation/platform");
 
-        assert!(FanManager::discover(
-            platform,
-            tree.path().to_path_buf(),
-            state,
-            tree.path().join("missing-legacy.json"),
-        )
-        .is_err());
+        assert!(FanManager::discover(platform, tree.path().to_path_buf(), state,).is_err());
         assert_eq!(fs::read_to_string(fan.join("pwm1_enable")).unwrap(), "2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_request_is_rejected_before_suspend_handoff() {
+        let tree = TempTree::new();
+        ayaneo_fixture(&tree);
+        let platform =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("rootfs/usr/share/powerstation/platform");
+        let manager = FanManager::discover(
+            platform,
+            tree.path().into(),
+            tree.path().join("state/fan-state.yaml"),
+        )
+        .unwrap();
+        manager.sleep_monitor_healthy.store(true, Ordering::Release);
+        manager.start().await.unwrap();
+        let controller = Arc::clone(&manager.controllers[0].1);
+        let mut lock = controller.lock().await;
+        lock.set_manual(20).unwrap();
+        let queued_controller = Arc::clone(&controller);
+        let queued = tokio::spawn(async move { queued_controller.lock().await.set_manual(50) });
+        tokio::task::yield_now().await;
+        let sleeping_manager = manager.clone();
+        let sleeping = tokio::spawn(async move {
+            sleeping_manager
+                .prepare_for_sleep(Duration::from_secs(1))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.custom_control_allowed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(lock);
+        assert!(queued.await.unwrap().is_err());
+        sleeping.await.unwrap().unwrap();
+        let snapshot = controller.lock().await.snapshot();
+        assert!(snapshot.suspended);
+        assert!(snapshot.automatic_verified);
+        assert_eq!(snapshot.manual_percent, 20);
+        assert_eq!(
+            fs::read_to_string(tree.path().join("class/hwmon/hwmon2/pwm1_enable")).unwrap(),
+            "2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_budget_expires_even_when_controller_is_busy() {
+        let tree = TempTree::new();
+        ayaneo_fixture(&tree);
+        let platform =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("rootfs/usr/share/powerstation/platform");
+        let manager = FanManager::discover(
+            platform,
+            tree.path().into(),
+            tree.path().join("state/fan-state.yaml"),
+        )
+        .unwrap();
+        manager.sleep_monitor_healthy.store(true, Ordering::Release);
+        manager.start().await.unwrap();
+        let controller = Arc::clone(&manager.controllers[0].1);
+        let lock = controller.lock().await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.prepare_for_sleep(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("delay budget"));
+        assert!(!manager.custom_control_allowed.load(Ordering::Acquire));
+        drop(lock);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if controller.lock().await.snapshot().suspended {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(controller.lock().await.set_manual(20).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -689,13 +807,11 @@ mod tests {
         let platform =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("rootfs/usr/share/powerstation/platform");
         let state = tree.path().join("state/fan-state.yaml");
-        let manager = FanManager::discover(
-            platform,
-            tree.path().to_path_buf(),
-            state.clone(),
-            tree.path().join("missing-legacy.json"),
-        )
-        .unwrap();
+        let manager =
+            FanManager::discover(platform, tree.path().to_path_buf(), state.clone()).unwrap();
+        // The P2P contract fixture has no logind; lifecycle tests exercise the
+        // real inhibitor handshake on a private message bus.
+        manager.sleep_monitor_healthy.store(true, Ordering::Release);
         manager.start().await.unwrap();
 
         let guid = zbus::Guid::generate();
@@ -778,6 +894,38 @@ mod tests {
             fs::read_to_string(tree.path().join("class/hwmon/hwmon2/pwm1_enable")).unwrap(),
             "2"
         );
+        let _: () = device.call("SetManual", &(20u8,)).await.unwrap();
+        let properties = zbus::fdo::PropertiesProxy::builder(&client)
+            .destination("org.shadowblip.PowerStation")
+            .unwrap()
+            .path(fans[0].as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut changes = properties.receive_properties_changed().await.unwrap();
+        fs::remove_file(tree.path().join("class/hwmon/hwmon9/temp1_input")).unwrap();
+        let failed: zbus::Result<()> = device.call("SetManual", &(50u8,)).await;
+        assert!(failed.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let change = changes.next().await.unwrap();
+                let args = change.args().unwrap();
+                if args.interface_name() == "org.shadowblip.Fan.Device"
+                    && args.changed_properties().contains_key("TelemetryValid")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!device.get_property::<bool>("TelemetryValid").await.unwrap());
+        assert_eq!(
+            device.get_property::<String>("Mode").await.unwrap(),
+            "automatic"
+        );
+        let _: () = device.call("SetAutomatic", &()).await.unwrap();
         manager.shutdown().await.unwrap();
         let saved = fs::read_to_string(state).unwrap();
         assert!(saved.contains("mode: automatic"));

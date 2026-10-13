@@ -117,10 +117,6 @@ pub struct TemperatureSource {
     pub required: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeValues {
@@ -366,13 +362,6 @@ impl FanConfig {
     }
 }
 
-fn require_text(kind: &str, value: &str) -> Result<(), ConfigError> {
-    if value.trim().is_empty() || value.trim() != value {
-        return Err(ConfigError(format!("{kind} must be non-empty and trimmed")));
-    }
-    Ok(())
-}
-
 pub fn load_databases(platform_dir: &Path) -> Result<Vec<DeviceConfig>, ConfigError> {
     let directory = fs::read_dir(platform_dir).map_err(|error| {
         ConfigError(format!(
@@ -472,6 +461,17 @@ fn validate_devices(devices: &[DeviceConfig]) -> Result<(), ConfigError> {
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn require_text(kind: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() || value.trim() != value {
+        return Err(ConfigError(format!("{kind} must be non-empty and trimmed")));
     }
     Ok(())
 }
