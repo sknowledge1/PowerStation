@@ -852,7 +852,21 @@ mod tests {
         assert_eq!(device.get_property::<u32>("ApiVersion").await.unwrap(), 1);
         assert_eq!(device.get_property::<u32>("PwmMax").await.unwrap(), 255);
         assert_eq!(device.get_property::<u32>("StallRpm").await.unwrap(), 300);
+        assert!(device
+            .get_property::<Vec<(f64, u8)>>("CustomCurve")
+            .await
+            .unwrap()
+            .is_empty());
+        let custom = vec![(40.0, 20u8), (95.0, 100u8)];
+        let _: () = device.call("SetCurve", &(custom.clone(),)).await.unwrap();
         let _: () = device.call("ApplyPreset", &("Quiet",)).await.unwrap();
+        assert_eq!(
+            device
+                .get_property::<Vec<(f64, u8)>>("CustomCurve")
+                .await
+                .unwrap(),
+            custom
+        );
         assert_eq!(
             device.get_property::<String>("Mode").await.unwrap(),
             "preset"

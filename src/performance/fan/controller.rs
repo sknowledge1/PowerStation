@@ -30,6 +30,7 @@ pub struct FanSnapshot {
     pub effective_percent: Option<u8>,
     pub manual_percent: u8,
     pub curve: Vec<CurvePoint>,
+    pub custom_curve: Vec<CurvePoint>,
     pub presets: Vec<String>,
     pub active_preset: Option<String>,
     pub fault: Option<String>,
@@ -287,6 +288,7 @@ impl FanController {
             effective_percent: self.effective_percent,
             manual_percent: self.state.manual_percent,
             curve: self.selected_curve().unwrap_or_default(),
+            custom_curve: self.state.curve.clone(),
             presets: self.config.presets.keys().cloned().collect(),
             active_preset,
             fault: self.fault.clone(),
@@ -950,6 +952,25 @@ mod tests {
             FanController::new("example".into(), config, fixture.sysfs(), store).unwrap();
         controller.start().unwrap();
         controller
+    }
+
+    #[test]
+    fn saved_custom_curve_remains_visible_while_a_preset_is_selected() {
+        let fixture = Fixture::new(0);
+        let mut controller = controller(&fixture, BackendPreference::Auto);
+        assert!(controller.snapshot().custom_curve.is_empty());
+        let mut custom = controller.config.presets["Quiet"].clone();
+        custom[1].percent = 25;
+        controller.set_curve(custom.clone()).unwrap();
+        controller.apply_preset("Quiet").unwrap();
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.custom_curve, custom);
+        assert_ne!(snapshot.curve, snapshot.custom_curve);
+        controller.prepare_for_sleep().unwrap();
+        controller.resume().unwrap();
+        assert_eq!(controller.snapshot().custom_curve, custom);
+        let store = StateStore::open(fixture.state.clone()).unwrap();
+        assert_eq!(store.get(controller.state_key()).curve, custom);
     }
 
     #[test]

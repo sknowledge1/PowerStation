@@ -88,6 +88,10 @@
      -->
     <property name="Curve" type="a(dy)" access="read"/>
     <!--
+     Saved custom curve, retained independently of the selected preset. Empty before the first custom curve is saved.
+    -->
+    <property name="CustomCurve" type="a(dy)" access="read"/>
+    <!--
      Required native point count for hardware curves; 0 for software curves.
      -->
     <property name="CurvePointCount" type="q" access="read"/>

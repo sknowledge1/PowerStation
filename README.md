@@ -151,3 +151,5 @@ busctl set-property org.shadowblip.PowerStation /org/shadowblip/Performance/CPU/
 ## License
 
 PowerStation is licensed under THE GNU GPLv3+. See LICENSE for details.
+
+The fan API exposes the saved `CustomCurve` independently of a selected preset. D-Bus activation is installed by both archive and RPM packaging, allowing a native client to start the supervised service without a manual setup command.

@@ -88,6 +88,7 @@
 | **Backend** | *read* | *s* | Curve backend: software_curve or hardware_curve. Manual mode always uses the monitored software policy. |
 | **Controlling** | *read* | *b* | Whether PowerStation currently owns manual or hardware-curve control. |
 | **Curve** | *read* | *a(dy)* | Selected custom or preset curve as temperature/percentage pairs. A saved custom curve can remain visible in automatic or manual mode. |
+| **CustomCurve** | *read* | *a(dy)* | Saved custom curve, retained independently of the selected preset. Empty before the first custom curve is saved. |
 | **CurvePointCount** | *read* | *q* | Required native point count for hardware curves; 0 for software curves. |
 | **EffectivePercent** | *read* | *n* | Applied software duty or estimated hardware-curve duty, including driver quantization tolerance. Returns -1 when unavailable or firmware owns control. |
 | **EmergencyHandoffTemperatureC** | *read* | *d* | Temperature at which custom control is abandoned for verified firmware automatic mode. |

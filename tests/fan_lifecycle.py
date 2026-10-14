@@ -234,6 +234,9 @@ class Harness:
         self.login_process.terminate()
         self.login_process.wait(timeout=5)
         wait(lambda: (self.fan / "pwm1_enable").read_text() == "2", "fallback after logind owner loss")
+        # Firmware recovery precedes the atomic state-file update. Observe
+        # both outcomes instead of racing persistence after the sysfs write.
+        wait(lambda: "mode: automatic" in self.state.read_text(), "saved Automatic after logind owner loss")
         self.check("mode: automatic" in self.state.read_text(), "owner loss persists Automatic")
         self.systemctl("stop", check=False)
         self.login_process = self.start_logind()

@@ -66,6 +66,7 @@ impl FanDevice {
         self.effective_percent_changed(emitter).await?;
         self.manual_percent_changed(emitter).await?;
         self.curve_changed(emitter).await?;
+        self.custom_curve_changed(emitter).await?;
         self.active_preset_changed(emitter).await?;
         self.fault_changed(emitter).await?;
         self.automatic_verified_changed(emitter).await?;
@@ -211,6 +212,17 @@ impl FanDevice {
         self.snapshot()
             .await
             .curve
+            .into_iter()
+            .map(|point| (point.temperature_c, point.percent))
+            .collect()
+    }
+
+    /// Saved custom curve, retained independently of the selected preset. Empty before the first custom curve is saved.
+    #[zbus(property)]
+    pub async fn custom_curve(&self) -> Vec<(f64, u8)> {
+        self.snapshot()
+            .await
+            .custom_curve
             .into_iter()
             .map(|point| (point.temperature_c, point.percent))
             .collect()

@@ -33,6 +33,8 @@ install: build ## Install PowerStation to the given prefix (default: PREFIX=/usr
 		$(PREFIX)/bin/powerstation
 	install -D -m 644 rootfs/usr/share/dbus-1/system.d/org.shadowblip.PowerStation.conf \
 		$(PREFIX)/share/dbus-1/system.d/org.shadowblip.PowerStation.conf
+	install -D -m 644 rootfs/usr/share/dbus-1/system-services/org.shadowblip.PowerStation.service \
+		$(PREFIX)/share/dbus-1/system-services/org.shadowblip.PowerStation.service
 	install -D -m 644 rootfs/usr/lib/systemd/system/powerstation.service \
 		$(PREFIX)/lib/systemd/system/powerstation.service
 	install -D -m644 -t $(PREFIX)/share/powerstation/platform/ \
@@ -45,6 +47,7 @@ endif
 uninstall: ## Uninstall PowerStation
 	rm $(PREFIX)/bin/powerstation
 	rm $(PREFIX)/share/dbus-1/system.d/org.shadowblip.PowerStation.conf
+	rm $(PREFIX)/share/dbus-1/system-services/org.shadowblip.PowerStation.service
 	rm $(PREFIX)/lib/systemd/system/powerstation.service
 
 ##@ Development
