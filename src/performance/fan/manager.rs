@@ -47,7 +47,7 @@ impl From<ControllerError> for ManagerError {
 trait LoginManager {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
 
-    #[zbus(property)]
+    #[zbus(property, name = "InhibitDelayMaxUSec")]
     fn inhibit_delay_max_usec(&self) -> zbus::Result<u64>;
 
     #[zbus(signal)]
@@ -406,7 +406,13 @@ impl FanManager {
         connection: Connection,
         ready: oneshot::Sender<Result<(), String>>,
     ) -> Result<(), ManagerError> {
-        let proxy = match LoginManagerProxy::new(&connection).await {
+        // logind's GetAll can fail on unrelated properties such as bootloader
+        // entries. Read only the inhibitor budget; sleep events are signals.
+        let proxy = match LoginManagerProxy::builder(&connection)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+        {
             Ok(proxy) => proxy,
             Err(error) => {
                 let error = ManagerError(error.to_string());

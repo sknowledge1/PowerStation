@@ -1,4 +1,5 @@
 //! Private-bus logind fixture for tests/fan_lifecycle.py. Never uses the host bus.
+use std::collections::HashMap;
 use std::error::Error;
 use std::os::fd::OwnedFd as StdOwnedFd;
 use std::os::unix::net::UnixStream;
@@ -10,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedFd;
+use zbus::zvariant::OwnedValue;
 use zbus::{fdo, interface};
 
 struct LoginManager {
@@ -23,6 +25,44 @@ struct TestControl {
     changed: Arc<Notify>,
     delay: Duration,
     root: PathBuf,
+}
+
+// Reproduce a real logind where one unrelated property makes GetAll fail,
+// while the individual inhibitor-budget property and Inhibit still work.
+struct FaultyProperties {
+    active: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+#[interface(name = "org.freedesktop.DBus.Properties")]
+impl FaultyProperties {
+    fn get(&self, interface_name: &str, property_name: &str) -> fdo::Result<OwnedValue> {
+        match (interface_name, property_name) {
+            ("org.freedesktop.login1.Manager", "InhibitDelayMaxUSec") => {
+                Ok((self.delay.as_micros() as u64).into())
+            }
+            ("org.shadowblip.Fan.TestLogind", "ActiveInhibitors") => {
+                Ok((self.active.load(Ordering::Acquire) as u32).into())
+            }
+            _ => Err(fdo::Error::UnknownProperty(property_name.into())),
+        }
+    }
+
+    fn get_all(&self, interface_name: &str) -> fdo::Result<HashMap<String, OwnedValue>> {
+        if interface_name == "org.freedesktop.login1.Manager" {
+            return Err(fdo::Error::Failed(
+                "unrelated BootLoaderEntries property failed".into(),
+            ));
+        }
+        let mut values = HashMap::new();
+        if interface_name == "org.shadowblip.Fan.TestLogind" {
+            values.insert(
+                "ActiveInhibitors".into(),
+                (self.active.load(Ordering::Acquire) as u32).into(),
+            );
+        }
+        Ok(values)
+    }
 }
 
 #[interface(name = "org.freedesktop.login1.Manager")]
@@ -51,7 +91,7 @@ impl LoginManager {
         Ok(descriptor.into())
     }
 
-    #[zbus(property(emits_changed_signal = "const"))]
+    #[zbus(property(emits_changed_signal = "const"), name = "InhibitDelayMaxUSec")]
     fn inhibit_delay_max_usec(&self) -> u64 {
         self.delay.as_micros() as u64
     }
@@ -119,13 +159,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .serve_at(
             "/org/freedesktop/login1",
             TestControl {
-                active,
+                active: Arc::clone(&active),
                 changed,
                 delay,
                 root,
             },
         )?
         .build()
+        .await?;
+    _connection
+        .object_server()
+        .remove::<zbus::fdo::Properties, _>("/org/freedesktop/login1")
+        .await?;
+    _connection
+        .object_server()
+        .at(
+            "/org/freedesktop/login1",
+            FaultyProperties { active, delay },
+        )
         .await?;
     std::future::pending::<()>().await;
     Ok(())

@@ -119,6 +119,12 @@ class Harness:
         if not self.address:
             raise RuntimeError("private D-Bus daemon did not start")
         self.login_process = self.start_logind()
+        self.check(self.bus("call", LOGIN, LOGIN_PATH, "org.freedesktop.DBus.Properties",
+                            "GetAll", "s", "org.freedesktop.login1.Manager", check=False).returncode != 0,
+                   "fixture reproduces logind GetAll failure")
+        self.check(self.bus("get-property", LOGIN, LOGIN_PATH, "org.freedesktop.login1.Manager",
+                            "InhibitDelayMaxUSec", check=False).returncode == 0,
+                   "inhibitor budget remains individually readable")
 
         unit_file = Path(__file__).resolve().parents[1] / "rootfs/usr/lib/systemd/system/powerstation.service"
         properties = []
