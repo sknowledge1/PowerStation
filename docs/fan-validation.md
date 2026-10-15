@@ -7,6 +7,8 @@ packages/images remain separate release gates.
 
 ## Reproducible software checks
 
+The packaged startup safeguard is documented in [fan-startup.md](fan-startup.md). Include its mandatory pre-start command and preserved private runtime directory in package inspection. Lifecycle checks additionally verify the actual first invocation, record preservation through clean/crash/watchdog restart and corrupt-record rejection before service exposure. These checks do not change fan API v2 or qualify physical boot restoration.
+
 Use the repository's Rust 1.88 Linux Dockerfile. It includes formatting/Clippy,
 native and aarch64 libudev development files, and target-specific pkg-config
 paths. Keep build output and Cargo home isolated; builds use the existing lock.

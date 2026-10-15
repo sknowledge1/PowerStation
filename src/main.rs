@@ -11,12 +11,21 @@ use crate::performance::{cpu::cpu_features, fan::FanManager, gpu::dbus};
 
 mod constants;
 mod performance;
+mod startup_record;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn Error>> {
     SimpleLogger::new().init().unwrap();
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     log::info!("Starting PowerStation v{}", VERSION);
+
+    if std::env::args().any(|argument| argument == "--record-fan-startup") {
+        if std::env::args().len() != 2 {
+            return Err("--record-fan-startup accepts no other arguments".into());
+        }
+        startup_record::record_service_start()?;
+        return Ok(());
+    }
 
     if std::env::args().any(|argument| argument == "--restore-fans-auto") {
         FanManager::restore_default()?;

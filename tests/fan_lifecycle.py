@@ -49,6 +49,8 @@ class Harness:
         self.binary = binary
         self.logind = logind
         self.unit = f"powerstation-fan-test-{uuid.uuid4().hex}.service"
+        self.startup_directory = Path(os.environ["XDG_RUNTIME_DIR"]) / (self.unit.removesuffix(".service") + "-startup")
+        self.startup_record = self.startup_directory / "first.json"
         self.processes = []
         self.logs = []
         self.assertions = 0
@@ -162,6 +164,10 @@ class Harness:
                     continue
                 if key == "ExecStopPost":
                     value = f"{self.binary} --restore-fans-auto"
+                if key == "ExecStartPre":
+                    value = f"{self.binary} --record-fan-startup"
+                if key == "RuntimeDirectory":
+                    value = self.startup_directory.name
                 properties += [f"--property={key}={value}"]
         self.service_properties = properties
         self.start_service()
@@ -180,7 +186,8 @@ class Harness:
             f"--setenv=POWERSTATION_FAN_SYSFS_ROOT={self.sysfs}",
             f"--setenv=POWERSTATION_FAN_STATE_PATH={self.state}",
             f"--setenv=POWERSTATION_FAN_PROFILE_DIR={self.profiles}",
-            f"--setenv=POWERSTATION_FAN_PROFILE_OVERRIDE_DIR={self.overrides}", str(self.binary), check=check)
+            f"--setenv=POWERSTATION_FAN_PROFILE_OVERRIDE_DIR={self.overrides}",
+            f"--setenv=POWERSTATION_FAN_STARTUP_PATH={self.startup_record}", str(self.binary), check=check)
 
     def ready(self):
         wait(lambda: self.get("TelemetryValid", SENSOR, "org.shadowblip.Fan.Sensor") == "true", "validated fan telemetry")
@@ -228,6 +235,11 @@ class Harness:
             self.check(contract(live, name) == contract(binding.read_text(), name), f"live {name} signatures match checked-in XML")
 
     def exercise(self):
+        first_record = self.startup_record.read_bytes()
+        evidence = json.loads(first_record)
+        self.check(evidence["version"] == 1 and evidence["boot_id"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip(), "native startup record identifies the boot")
+        self.check(evidence["invocation_id"] == self.systemctl("show", "--property=InvocationID", "--value").stdout.strip(), "first native invocation matches systemd")
+        self.check(self.startup_record.stat().st_mode & 0o777 == 0o600 and self.startup_directory.stat().st_mode & 0o777 == 0o700, "startup evidence has private permissions")
         self.check(self.get("ApiVersion", COLLECTION, "org.shadowblip.Fan") == "2", "API v2")
         self.check(self.get("Mode") == "automatic", "fresh start ignores stale Manual")
         self.check(self.current_profile() == "", "startup has no selected profile")
@@ -297,6 +309,8 @@ class Harness:
             self.start_service()
             self.ready()
             self.mode("automatic")
+            self.check(self.startup_record.read_bytes() == first_record, "clean stop/start preserves first invocation evidence")
+            self.check(evidence["invocation_id"] != self.systemctl("show", "--property=InvocationID", "--value").stdout.strip(), "a later managed invocation cannot appear first")
             self.check((self.fan / "pwm1_enable").read_text() == "2", "clean restart ignores valid or malformed legacy state")
             self.check(self.state.read_text() == legacy, "legacy file unchanged on clean restart")
         self.legacy = self.state.read_text()
@@ -318,6 +332,7 @@ class Harness:
             self.check((self.fan / "pwm1_enable").read_text() == "2", f"{name} returns to firmware")
             self.check(self.state.read_text() == self.legacy, f"{name} leaves malformed legacy state untouched")
             self.check(self.current_profile() == "", f"{name} does not replay profile")
+            self.check(self.startup_record.read_bytes() == first_record, f"{name} preserves the first-invocation record")
             print(f"PASS {name} recovery", flush=True)
 
         self.profile("manual", 20)
@@ -353,6 +368,14 @@ class Harness:
         self.systemctl("stop", check=False)
         self.configuration.write_text(self.original_yaml)
         print("PASS malformed hardware configuration rejection", flush=True)
+        self.startup_record.write_text("{")
+        self.start_service(check=False)
+        wait(lambda: self.systemctl("show", "--property=Result", "--value").stdout.strip() == "exit-code", "corrupt startup evidence rejection")
+        self.check(self.startup_record.read_text() == "{", "corrupt first record is not replaced")
+        self.check(self.profile("manual", 50, check=False).returncode != 0, "unrecorded startup never exposes fan controls")
+        self.check((self.fan / "pwm1_enable").read_text() == "2", "startup-record failure retains Automatic cleanup")
+        self.systemctl("stop", check=False)
+        print("PASS first-invocation evidence and corrupt startup rejection", flush=True)
         print(f"PASS lifecycle harness: {self.assertions} assertions", flush=True)
 
     def close(self):
@@ -369,6 +392,8 @@ class Harness:
                     process.wait(timeout=5)
         for log in self.logs:
             log.close()
+        if self.startup_directory.exists():
+            shutil.rmtree(self.startup_directory)
 
 
 def main():
