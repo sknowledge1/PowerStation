@@ -1,5 +1,5 @@
-use super::config::CurvePoint;
-use super::controller::{ControllerError, FanController, FanSnapshot};
+use super::controller::{FanController, FanSnapshot};
+use super::manager::FanManager;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zbus::fdo;
@@ -8,394 +8,195 @@ use zbus::zvariant::ObjectPath;
 use zbus_macros::interface;
 
 pub struct FanBus {
-    object_paths: Vec<String>,
+    manager: FanManager,
 }
 
 impl FanBus {
-    pub fn new(object_paths: Vec<String>) -> Self {
-        Self { object_paths }
+    pub fn new(manager: FanManager) -> Self {
+        Self { manager }
+    }
+
+    pub async fn emit_changes(&self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+        self.current_profile_name_changed(emitter).await?;
+        self.current_profile_path_changed(emitter).await
     }
 }
 
 #[interface(name = "org.shadowblip.Fan")]
 impl FanBus {
-    /// Return fan object paths selected by the platform database; an unsupported system returns an empty list.
-    pub async fn enumerate_fans(&self) -> fdo::Result<Vec<ObjectPath>> {
-        Ok(self
-            .object_paths
-            .iter()
-            .map(|path| ObjectPath::from_string_unchecked(path.clone()))
-            .collect())
+    /// Load a complete YAML profile by filename in the approved profile directories. A same-name distro file replaces the packaged file. Validate every fan before writing; any application failure returns all affected fans to Automatic.
+    pub async fn load_profile(
+        &self,
+        file: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let result = self.manager.load_profile_file(file).await;
+        self.manager.emit_changes(connection).await;
+        result.map_err(|error| fdo::Error::Failed(error.to_string()))
+    }
+
+    /// Load the same profile structure as JSON, without saving it. An all-automatic profile works during lifecycle restrictions and without telemetry. Clients own saving and reloading selections after service startup.
+    pub async fn load_profile_json(
+        &self,
+        json: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let result = self.manager.load_profile_json(json).await;
+        self.manager.emit_changes(connection).await;
+        result.map_err(|error| fdo::Error::Failed(error.to_string()))
+    }
+
+    /// Return the fan object paths for this platform. Unsupported systems return an empty list.
+    pub async fn enumerate_fans(&self) -> Vec<ObjectPath<'static>> {
+        self.manager
+            .fan_paths()
+            .into_iter()
+            .map(ObjectPath::from_string_unchecked)
+            .collect()
+    }
+
+    /// Return stable, platform-selected temperature sensor objects. Profiles reference their Id properties.
+    pub async fn enumerate_sensors(&self) -> Vec<ObjectPath<'static>> {
+        self.manager
+            .sensor_paths()
+            .await
+            .into_iter()
+            .map(ObjectPath::from_string_unchecked)
+            .collect()
+    }
+
+    /// Version 2 replaces the preset/custom-curve API with complete profiles.
+    #[zbus(property)]
+    pub fn api_version(&self) -> u32 {
+        2
+    }
+
+    /// Active profile name, including during successful suspend. Empty after startup or a controller fault.
+    #[zbus(property)]
+    pub async fn current_profile_name(&self) -> String {
+        self.manager.current_profile().await.0
+    }
+
+    /// Resolved profile file path. Empty for JSON profiles, startup, or a controller fault.
+    #[zbus(property)]
+    pub async fn current_profile_path(&self) -> String {
+        self.manager.current_profile().await.1
     }
 }
 
 #[derive(Clone)]
 pub struct FanDevice {
-    pub controller: Arc<Mutex<FanController>>,
+    controller: Arc<Mutex<FanController>>,
 }
 
 impl FanDevice {
     pub fn new(controller: Arc<Mutex<FanController>>) -> Self {
         Self { controller }
     }
-
     async fn snapshot(&self) -> FanSnapshot {
         self.controller.lock().await.snapshot()
     }
-
-    async fn update<F>(&self, emitter: &SignalEmitter<'_>, operation: F) -> fdo::Result<()>
-    where
-        F: FnOnce(&mut FanController) -> Result<(), ControllerError>,
-    {
-        let result = {
-            let mut controller = self.controller.lock().await;
-            operation(&mut controller).map_err(|error| fdo::Error::Failed(error.to_string()))
-        };
-        // Failed operations can enter automatic fallback. Notify clients even
-        // on that path, retaining the original error if notification also fails.
-        let notification = self.emit_configuration_changes(emitter).await;
-        result.and(notification)
-    }
-
     pub async fn emit_all_changes(&self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
         self.mode_changed(emitter).await?;
-        self.backend_changed(emitter).await?;
-        self.temperature_c_changed(emitter).await?;
-        self.telemetry_valid_changed(emitter).await?;
-        self.rpm_changed(emitter).await?;
-        self.effective_percent_changed(emitter).await?;
-        self.manual_percent_changed(emitter).await?;
-        self.curve_changed(emitter).await?;
-        self.custom_curve_changed(emitter).await?;
-        self.active_preset_changed(emitter).await?;
-        self.fault_changed(emitter).await?;
-        self.automatic_verified_changed(emitter).await?;
-        self.controlling_changed(emitter).await?;
-        self.suspended_changed(emitter).await?;
-        self.curve_point_count_changed(emitter).await?;
-        Ok(())
-    }
-
-    async fn emit_configuration_changes(&self, emitter: &SignalEmitter<'_>) -> fdo::Result<()> {
-        self.emit_all_changes(emitter)
-            .await
-            .map_err(|error| fdo::Error::Failed(error.to_string()))
+        self.percent_changed(emitter).await?;
+        self.percent_valid_changed(emitter).await?;
+        self.fault_changed(emitter).await
     }
 }
 
 #[interface(name = "org.shadowblip.Fan.Device")]
 impl FanDevice {
-    /// Restore and verify firmware automatic mode, then persist that selection. Available during suspend and faults without temperature or RPM telemetry.
-    pub async fn set_automatic(
-        &self,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<()> {
-        self.update(&emitter, FanController::set_automatic).await
-    }
-
-    /// Select and persist a manual percentage within the platform limits. The running floor and thermal overrides can raise the effective duty. Fails without changing the selection while lifecycle protection is unavailable.
-    pub async fn set_manual(
-        &self,
-        percent: u8,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<()> {
-        self.update(&emitter, |controller| controller.set_manual(percent))
-            .await
-    }
-
-    /// Select and persist increasing temperature/percentage points ending at 100 percent. Hardware curves require exactly CurvePointCount points; software curves accept two or more. Fails during lifecycle transitions.
-    pub async fn set_curve(
-        &self,
-        points: Vec<(f64, u8)>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<()> {
-        let points = points
-            .into_iter()
-            .map(|(temperature_c, percent)| CurvePoint {
-                temperature_c,
-                percent,
-            })
-            .collect();
-        self.update(&emitter, |controller| controller.set_curve(points))
-            .await
-    }
-
-    /// Select and persist a named platform preset. Fails for unknown names or while lifecycle protection is unavailable.
-    pub async fn apply_preset(
-        &self,
-        name: &str,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<()> {
-        self.update(&emitter, |controller| controller.apply_preset(name))
-            .await
-    }
-
-    /// Version of the fan D-Bus contract; currently 1.
-    #[zbus(property)]
-    pub async fn api_version(&self) -> u32 {
-        1
-    }
-
-    /// Stable fan identifier within the selected platform.
+    /// Stable fan ID used in profiles.
     #[zbus(property)]
     pub async fn id(&self) -> String {
         self.snapshot().await.id
     }
 
-    /// Human-readable fan name from the platform database.
+    /// Human-readable fan name.
     #[zbus(property)]
     pub async fn name(&self) -> String {
         self.snapshot().await.name
     }
 
-    /// Persisted selection: automatic, manual, curve, or preset. During suspend the selected mode is retained while firmware controls the fan.
+    /// Current mode: automatic, manual, software_curve, or firmware_curve. Suspend temporarily reports automatic while retaining the live profile in memory.
     #[zbus(property)]
     pub async fn mode(&self) -> String {
         self.snapshot().await.mode
     }
 
-    /// Curve backend: software_curve or hardware_curve. Manual mode always uses the monitored software policy.
-    #[zbus(property)]
-    pub async fn backend(&self) -> String {
-        self.snapshot().await.backend
-    }
-
-    /// Supported selections, independent of temporary lifecycle restrictions. Includes preset only when Presets is nonempty.
+    /// Modes supported by the trusted platform configuration and discovered hardware.
     #[zbus(property)]
     pub async fn available_modes(&self) -> Vec<String> {
-        let snapshot = self.snapshot().await;
-        let mut modes = vec!["automatic".into(), "manual".into(), "curve".into()];
-        if !snapshot.presets.is_empty() {
-            modes.push("preset".into());
-        }
-        modes
+        self.snapshot().await.available_modes
     }
 
-    /// Hottest configured sensor reading in degrees Celsius. Returns 0 when TelemetryValid is false.
+    /// Applied software duty from 0 to 100 percent. Read only when PercentValid is true; firmware duty is unavailable.
     #[zbus(property)]
-    pub async fn temperature_c(&self) -> f64 {
-        self.snapshot().await.temperature_c.unwrap_or(0.0)
+    pub async fn percent(&self) -> u8 {
+        self.snapshot().await.effective_percent.unwrap_or(0)
     }
 
-    /// Whether a complete trusted temperature/RPM sample is available. False after faults and during suspend until fresh telemetry is validated.
+    /// Whether Percent is available. False in Automatic, native firmware curves, suspend, and faults.
     #[zbus(property)]
-    pub async fn telemetry_valid(&self) -> bool {
-        let snapshot = self.snapshot().await;
-        snapshot.temperature_c.is_some() && snapshot.rpm.is_some()
+    pub async fn percent_valid(&self) -> bool {
+        self.snapshot().await.effective_percent.is_some()
     }
 
-    /// Last validated fan speed in RPM. Returns 0 when TelemetryValid is false.
-    #[zbus(property)]
-    pub async fn rpm(&self) -> u32 {
-        self.snapshot().await.rpm.unwrap_or(0)
-    }
-
-    /// Applied software duty or estimated hardware-curve duty, including driver quantization tolerance. Returns -1 when unavailable or firmware owns control.
-    #[zbus(property)]
-    pub async fn effective_percent(&self) -> i16 {
-        self.snapshot()
-            .await
-            .effective_percent
-            .map(i16::from)
-            .unwrap_or(-1)
-    }
-
-    /// Saved manual target percentage, retained when another mode is selected.
-    #[zbus(property)]
-    pub async fn manual_percent(&self) -> u8 {
-        self.snapshot().await.manual_percent
-    }
-
-    /// Selected custom or preset curve as temperature/percentage pairs. A saved custom curve can remain visible in automatic or manual mode.
-    #[zbus(property)]
-    pub async fn curve(&self) -> Vec<(f64, u8)> {
-        self.snapshot()
-            .await
-            .curve
-            .into_iter()
-            .map(|point| (point.temperature_c, point.percent))
-            .collect()
-    }
-
-    /// Saved custom curve, retained independently of the selected preset. Empty before the first custom curve is saved.
-    #[zbus(property)]
-    pub async fn custom_curve(&self) -> Vec<(f64, u8)> {
-        self.snapshot()
-            .await
-            .custom_curve
-            .into_iter()
-            .map(|point| (point.temperature_c, point.percent))
-            .collect()
-    }
-
-    /// Available preset names from the platform database.
-    #[zbus(property)]
-    pub async fn presets(&self) -> Vec<String> {
-        self.snapshot().await.presets
-    }
-
-    /// Selected preset name, or an empty string outside preset mode.
-    #[zbus(property)]
-    pub async fn active_preset(&self) -> String {
-        self.snapshot().await.active_preset.unwrap_or_default()
-    }
-
-    /// Last fan fault, or an empty string after successful configuration. Fresh telemetry alone does not acknowledge an earlier fault.
+    /// Last controller failure, or empty after a successful profile load.
     #[zbus(property)]
     pub async fn fault(&self) -> String {
         self.snapshot().await.fault.unwrap_or_default()
     }
+}
 
-    /// Whether the most recent ownership read or automatic-mode write verified firmware automatic mode.
+pub struct FanSensor {
+    controller: Arc<Mutex<FanController>>,
+    local_id: String,
+    name: String,
+}
+
+impl FanSensor {
+    pub fn new(controller: Arc<Mutex<FanController>>, local_id: String, name: String) -> Self {
+        Self {
+            controller,
+            local_id,
+            name,
+        }
+    }
+    async fn temperature(&self) -> Option<f64> {
+        let controller = self.controller.lock().await;
+        controller.sensor_temperature(&format!("{}/{}", controller.id(), self.local_id))
+    }
+    pub async fn emit_changes(&self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+        self.temperature_c_changed(emitter).await?;
+        self.telemetry_valid_changed(emitter).await
+    }
+}
+
+#[interface(name = "org.shadowblip.Fan.Sensor")]
+impl FanSensor {
+    /// Stable sensor ID used in profile sensor lists.
     #[zbus(property)]
-    pub async fn automatic_verified(&self) -> bool {
-        self.snapshot().await.automatic_verified
+    pub async fn id(&self) -> String {
+        let controller = self.controller.lock().await;
+        format!("{}/{}", controller.id(), self.local_id)
     }
 
-    /// Whether PowerStation currently owns manual or hardware-curve control.
+    /// Human-readable sensor name.
     #[zbus(property)]
-    pub async fn controlling(&self) -> bool {
-        self.snapshot().await.controlling
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Whether the controller is paused for suspend or shutdown; custom selections are rejected while true.
+    /// Last validated temperature in degrees Celsius. Read only when TelemetryValid is true.
     #[zbus(property)]
-    pub async fn suspended(&self) -> bool {
-        self.snapshot().await.suspended
+    pub async fn temperature_c(&self) -> f64 {
+        self.temperature().await.unwrap_or(0.0)
     }
 
-    /// Required native point count for hardware curves; 0 for software curves.
+    /// Whether a valid reading is available. False during suspend and after telemetry loss.
     #[zbus(property)]
-    pub async fn curve_point_count(&self) -> u16 {
-        self.snapshot().await.curve_point_count
-    }
-
-    /// Minimum accepted manual or curve percentage.
-    #[zbus(property)]
-    pub async fn minimum_percent(&self) -> u8 {
-        self.controller.lock().await.config.limits.minimum_percent
-    }
-
-    /// Minimum software duty while the fan is running.
-    #[zbus(property)]
-    pub async fn minimum_running_percent(&self) -> u8 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .minimum_running_percent
-    }
-
-    /// Raw PWM value representing 0 percent.
-    #[zbus(property)]
-    pub async fn pwm_min(&self) -> u32 {
-        self.controller.lock().await.config.limits.pwm_min
-    }
-
-    /// Raw PWM value representing 100 percent.
-    #[zbus(property)]
-    pub async fn pwm_max(&self) -> u32 {
-        self.controller.lock().await.config.limits.pwm_max
-    }
-
-    /// Maximum permitted raw PWM readback difference caused by driver quantization.
-    #[zbus(property)]
-    pub async fn pwm_readback_tolerance(&self) -> u32 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .pwm_readback_tolerance
-    }
-
-    /// Software fan-stop threshold in degrees Celsius when a zero-percent target is permitted.
-    #[zbus(property)]
-    pub async fn stop_temperature_c(&self) -> f64 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .stop_temperature_c
-    }
-
-    /// Software fan restart threshold in degrees Celsius; restart occurs above this value.
-    #[zbus(property)]
-    pub async fn restart_temperature_c(&self) -> f64 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .restart_temperature_c
-    }
-
-    /// RPM below which a running fan is considered stalled after StallGraceSeconds.
-    #[zbus(property)]
-    pub async fn stall_rpm(&self) -> u32 {
-        self.controller.lock().await.config.limits.stall_rpm
-    }
-
-    /// Number of monitored one-second intervals allowed below StallRpm before automatic fallback.
-    #[zbus(property)]
-    pub async fn stall_grace_seconds(&self) -> u32 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .stall_grace_seconds
-    }
-
-    /// Temperature at which software control forces 100 percent; every accepted curve reaches 100 percent by this threshold.
-    #[zbus(property)]
-    pub async fn full_speed_temperature_c(&self) -> f64 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .full_speed_temperature_c
-    }
-
-    /// Temperature at which custom control is abandoned for verified firmware automatic mode.
-    #[zbus(property)]
-    pub async fn emergency_handoff_temperature_c(&self) -> f64 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .emergency_handoff_temperature_c
-    }
-
-    /// Lowest accepted telemetry temperature in degrees Celsius.
-    #[zbus(property)]
-    pub async fn minimum_valid_temperature_c(&self) -> f64 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .minimum_valid_temperature_c
-    }
-
-    /// Highest accepted telemetry temperature in degrees Celsius.
-    #[zbus(property)]
-    pub async fn maximum_valid_temperature_c(&self) -> f64 {
-        self.controller
-            .lock()
-            .await
-            .config
-            .limits
-            .maximum_valid_temperature_c
-    }
-
-    /// Highest accepted fan RPM; greater readings invalidate telemetry.
-    #[zbus(property)]
-    pub async fn maximum_valid_rpm(&self) -> u32 {
-        self.controller.lock().await.config.limits.maximum_valid_rpm
+    pub async fn telemetry_valid(&self) -> bool {
+        self.temperature().await.is_some()
     }
 }

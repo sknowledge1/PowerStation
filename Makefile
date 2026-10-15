@@ -37,6 +37,8 @@ install: build ## Install PowerStation to the given prefix (default: PREFIX=/usr
 		$(PREFIX)/share/dbus-1/system-services/org.shadowblip.PowerStation.service
 	install -D -m 644 rootfs/usr/lib/systemd/system/powerstation.service \
 		$(PREFIX)/lib/systemd/system/powerstation.service
+	install -d -m755 $(PREFIX)/share/powerstation/platform/ $(PREFIX)/powerstation/platform/fan_curves/
+	install -D -m644 -t $(PREFIX)/powerstation/platform/fan_curves/ rootfs/usr/powerstation/platform/fan_curves/*.yaml
 	install -D -m644 -t $(PREFIX)/share/powerstation/platform/ \
 		rootfs/usr/share/powerstation/platform/*
 ifndef NO_RELOAD
@@ -55,12 +57,12 @@ uninstall: ## Uninstall PowerStation
 .PHONY: debug
 debug: target/$(TARGET_ARCH)/debug/powerstation  ## Build debug build
 target/$(TARGET_ARCH)/debug/powerstation: $(ALL_RS) Cargo.lock
-	cargo build --target $(TARGET_ARCH)
+	cargo build --locked --target $(TARGET_ARCH)
 
 .PHONY: build
 build: target/$(TARGET_ARCH)/release/powerstation ## Build release build
 target/$(TARGET_ARCH)/release/powerstation: $(ALL_RS) Cargo.lock
-	cargo build --release --target $(TARGET_ARCH)
+	cargo build --release --locked --target $(TARGET_ARCH)
 
 .PHONY: all
 all: build debug ## Build release and debug builds
@@ -71,7 +73,7 @@ run: debug ## Build and run
 
 .PHONY: test
 test: debug ## Build and run all tests
-	cargo test -- --show-output
+	cargo test --locked -- --show-output
 
 FAN_TEST_BINARY ?= target/$(TARGET_ARCH)/debug/powerstation
 FAN_TEST_LOGIND ?= target/$(TARGET_ARCH)/debug/examples/fan_test_logind
@@ -118,7 +120,7 @@ dist/powerstation-$(ARCH).tar.gz: build
 dist-rpm: dist/$(NAME)-$(VERSION)-1.$(ARCH).rpm ## Build a redistributable RPM package
 dist/$(NAME)-$(VERSION)-1.$(ARCH).rpm: target/$(TARGET_ARCH)/release/$(NAME)
 	mkdir -p dist
-	cargo install cargo-generate-rpm
+	cargo install cargo-generate-rpm --version 0.21.0 --locked
 	cargo generate-rpm --target $(TARGET_ARCH)
 	cp ./target/$(TARGET_ARCH)/generate-rpm/$(NAME)-$(VERSION)-1.$(ARCH).rpm dist
 	cd dist && sha256sum $(NAME)-$(VERSION)-1.$(ARCH).rpm > $(NAME)-$(VERSION)-1.$(ARCH).rpm.sha256.txt
@@ -149,6 +151,8 @@ introspect: ## Generate DBus XML
 	busctl introspect org.shadowblip.PowerStation \
 		/org/shadowblip/Performance/Fan/$(INTROSPECT_FAN) --xml-interface > bindings/dbus-xml/org-shadowblip-fan-device.xml
 	xmlstarlet ed -L -d '//node[@name]' bindings/dbus-xml/org-shadowblip-fan-device.xml
+	busctl introspect org.shadowblip.PowerStation \
+		/org/shadowblip/Performance/Fan/$(INTROSPECT_FAN)/Sensor0 --xml-interface > bindings/dbus-xml/org-shadowblip-fan-sensor.xml
 
 XSL_TEMPLATE := ./docs/dbus2markdown.xsl
 .PHONY: docs
@@ -169,12 +173,16 @@ docs: ## Generate markdown docs for DBus interfaces
 	xsltproc --novalid -o docs/gpu-card-connector.md $(XSL_TEMPLATE) bindings/dbus-xml/org-shadowblip-gpu-card-connector.xml
 	mdformat ./docs/gpu-card-connector.md
 	sed -i 's/DBus Interface API/GPU.Card.Connector DBus Interface API/g' ./docs/gpu-card-connector.md
-	xsltproc --novalid -o docs/fan.md $(XSL_TEMPLATE) bindings/dbus-xml/org-shadowblip-fan.xml
+	xsltproc --novalid --stringparam interface-prefix org.shadowblip.Fan -o docs/fan.md $(XSL_TEMPLATE) bindings/dbus-xml/org-shadowblip-fan.xml
 	mdformat ./docs/fan.md
 	sed -i 's/DBus Interface API/Fan DBus Interface API/g' ./docs/fan.md
-	xsltproc --novalid -o docs/fan-device.md $(XSL_TEMPLATE) bindings/dbus-xml/org-shadowblip-fan-device.xml
+	xsltproc --novalid --stringparam interface-prefix org.shadowblip.Fan -o docs/fan-device.md $(XSL_TEMPLATE) bindings/dbus-xml/org-shadowblip-fan-device.xml
 	mdformat ./docs/fan-device.md
 	sed -i 's/DBus Interface API/Fan.Device DBus Interface API/g' ./docs/fan-device.md
+
+	xsltproc --novalid --stringparam interface-prefix org.shadowblip.Fan -o docs/fan-sensor.md $(XSL_TEMPLATE) bindings/dbus-xml/org-shadowblip-fan-sensor.xml
+	mdformat ./docs/fan-sensor.md
+	sed -i 's/DBus Interface API/Fan.Sensor DBus Interface API/g' ./docs/fan-sensor.md
 
 # Refer to .releaserc.yaml for release configuration
 .PHONY: sem-release 
@@ -198,7 +206,6 @@ in-docker: docker-builder
 		-e HOME=/home/build \
 		-e CARGO_HOME=/home/build/.cargo \
 		-e TARGET_ARCH=$(TARGET_ARCH) \
-		-e PKG_CONFIG_SYSROOT_DIR="/usr/$(ARCH)-linux-gnu" \
 		--user $(shell id -u):$(shell id -g) \
 		$(IMAGE_NAME):$(IMAGE_TAG) \
 		make $(TARGET)

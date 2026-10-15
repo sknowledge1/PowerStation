@@ -15,7 +15,9 @@ devices:
           parent_driver: ayaneo-ec
           channel: 1
         temperature_sources:
-          - hwmon_name: k10temp
+          - id: cpu
+            name: CPU temperature
+            hwmon_name: k10temp
             label: Tctl
             required: true
         backend: auto
@@ -34,24 +36,6 @@ devices:
           restart_temperature_c: 45.0
           stall_rpm: 300
           stall_grace_seconds: 7
-          full_speed_temperature_c: 95.0
-          emergency_handoff_temperature_c: 98.0
           minimum_valid_temperature_c: 5.0
           maximum_valid_temperature_c: 110.0
           maximum_valid_rpm: 20000
-        presets:
-          Quiet:
-            - temperature_c: 45.0
-              percent: 0
-            - temperature_c: 55.0
-              percent: 15
-            - temperature_c: 65.0
-              percent: 25
-            - temperature_c: 75.0
-              percent: 35
-            - temperature_c: 85.0
-              percent: 55
-            - temperature_c: 90.0
-              percent: 75
-            - temperature_c: 95.0
-              percent: 100

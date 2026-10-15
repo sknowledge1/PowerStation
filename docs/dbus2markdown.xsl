@@ -5,6 +5,7 @@
 <xsl:stylesheet version="1.0"
 xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
 xmlns:doc="http://www.freedesktop.org/dbus/1.0/doc.dtd">
+<xsl:param name="interface-prefix" select="''"/>
 <xsl:output encoding="UTF-8" omit-xml-declaration="yes" indent="no"/>
 
 <!-- zbus emits Rust documentation as comments immediately before members. -->
@@ -45,7 +46,7 @@ xmlns:doc="http://www.freedesktop.org/dbus/1.0/doc.dtd">
 
 <xsl:template match="/">
 # DBus Interface API
-<xsl:for-each select="node/interface">
+<xsl:for-each select="node/interface[starts-with(@name, $interface-prefix)]">
 ## <xsl:value-of select="@name"/>
   <xsl:text>&#xa;</xsl:text>
 <xsl:if test="property">

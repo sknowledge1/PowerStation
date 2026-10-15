@@ -999,6 +999,7 @@ dependencies = [
  "rog_platform",
  "sd-notify",
  "serde",
+ "serde_json",
  "simple_logger",
  "tokio",
  "toml",

@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
 
 pub const FAN_SCHEMA_VERSION: u32 = 1;
+
+// Provisional service policy, pending physical thermal acceptance.
+pub const FULL_SPEED_TEMPERATURE_C: f64 = 95.0;
+pub const FIRMWARE_HANDOFF_TEMPERATURE_C: f64 = 98.0;
 
 #[derive(Debug)]
 pub struct ConfigError(pub String);
@@ -97,7 +101,7 @@ pub struct FanConfig {
     pub manual_write_order: ManualWriteOrder,
     pub limits: FanLimits,
     #[serde(default)]
-    pub presets: BTreeMap<String, Vec<CurvePoint>>,
+    pub firmware_curve_sensor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +115,8 @@ pub struct HwmonSelector {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemperatureSource {
+    pub id: String,
+    pub name: String,
     pub hwmon_name: String,
     pub label: String,
     #[serde(default = "default_true")]
@@ -137,8 +143,6 @@ pub struct FanLimits {
     pub restart_temperature_c: f64,
     pub stall_rpm: u32,
     pub stall_grace_seconds: u32,
-    pub full_speed_temperature_c: f64,
-    pub emergency_handoff_temperature_c: f64,
     pub minimum_valid_temperature_c: f64,
     pub maximum_valid_temperature_c: f64,
     pub maximum_valid_rpm: u32,
@@ -217,7 +221,7 @@ impl FanConfig {
         for (index, point) in points.iter().enumerate() {
             if !point.temperature_c.is_finite()
                 || point.temperature_c < self.limits.minimum_valid_temperature_c
-                || point.temperature_c > self.limits.full_speed_temperature_c
+                || point.temperature_c > FULL_SPEED_TEMPERATURE_C
             {
                 return Err(ConfigError(format!(
                     "fan {} curve {name} point {index} has an invalid temperature",
@@ -255,7 +259,7 @@ impl FanConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        require_text("fan id", &self.id)?;
+        require_id("fan id", &self.id)?;
         require_text("fan name", &self.name)?;
         require_text("fan hwmon name", &self.hwmon.name)?;
         require_text("fan parent driver", &self.hwmon.parent_driver)?;
@@ -281,9 +285,22 @@ impl FanConfig {
                 self.id
             )));
         }
+        let mut sensor_ids = HashSet::new();
         for source in &self.temperature_sources {
+            require_id("sensor id", &source.id)?;
+            require_text("sensor name", &source.name)?;
+            if !sensor_ids.insert(&source.id) {
+                return Err(ConfigError(format!("duplicate sensor ID {}", source.id)));
+            }
             require_text("temperature hwmon name", &source.hwmon_name)?;
             require_text("temperature label", &source.label)?;
+        }
+        if self
+            .firmware_curve_sensor
+            .as_ref()
+            .is_some_and(|id| !sensor_ids.contains(id))
+        {
+            return Err(ConfigError("unknown native hardware sensor ID".into()));
         }
         let modes = &self.mode_values;
         if modes.automatic < 0
@@ -330,14 +347,11 @@ impl FanConfig {
         if !limits.minimum_valid_temperature_c.is_finite()
             || !limits.stop_temperature_c.is_finite()
             || !limits.restart_temperature_c.is_finite()
-            || !limits.full_speed_temperature_c.is_finite()
-            || !limits.emergency_handoff_temperature_c.is_finite()
             || !limits.maximum_valid_temperature_c.is_finite()
             || !(limits.minimum_valid_temperature_c <= limits.stop_temperature_c
                 && limits.stop_temperature_c < limits.restart_temperature_c
-                && limits.restart_temperature_c < limits.full_speed_temperature_c
-                && limits.full_speed_temperature_c < limits.emergency_handoff_temperature_c
-                && limits.emergency_handoff_temperature_c <= limits.maximum_valid_temperature_c)
+                && limits.restart_temperature_c < FULL_SPEED_TEMPERATURE_C
+                && FIRMWARE_HANDOFF_TEMPERATURE_C <= limits.maximum_valid_temperature_c)
         {
             return Err(ConfigError(format!(
                 "fan {} temperature limits are invalid",
@@ -353,10 +367,6 @@ impl FanConfig {
                 "fan {} RPM and stall limits are invalid",
                 self.id
             )));
-        }
-        for (name, points) in &self.presets {
-            require_text("preset name", name)?;
-            self.validate_curve(name, points)?;
         }
         Ok(())
     }
@@ -434,7 +444,7 @@ pub fn select_device(
 fn validate_devices(devices: &[DeviceConfig]) -> Result<(), ConfigError> {
     let mut device_ids = HashSet::new();
     for device in devices {
-        require_text("device id", &device.id)?;
+        require_id("device id", &device.id)?;
         require_text("device name", &device.name)?;
         if !device_ids.insert(device.id.clone()) {
             return Err(ConfigError(format!("duplicate device id {}", device.id)));
@@ -469,6 +479,19 @@ fn default_true() -> bool {
     true
 }
 
+fn require_id(kind: &str, value: &str) -> Result<(), ConfigError> {
+    require_text(kind, value)?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ConfigError(format!(
+            "{kind} must use ASCII letters, numbers, '-' or '_'"
+        )));
+    }
+    Ok(())
+}
+
 fn require_text(kind: &str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() || value.trim() != value {
         return Err(ConfigError(format!("{kind} must be non-empty and trimmed")));
@@ -490,6 +513,8 @@ mod tests {
                 channel: 1,
             },
             temperature_sources: vec![TemperatureSource {
+                id: "cpu".into(),
+                name: "CPU".into(),
                 hwmon_name: "k10temp".into(),
                 label: "Tctl".into(),
                 required: true,
@@ -511,25 +536,11 @@ mod tests {
                 restart_temperature_c: 45.0,
                 stall_rpm: 100,
                 stall_grace_seconds: 3,
-                full_speed_temperature_c: 95.0,
-                emergency_handoff_temperature_c: 98.0,
                 minimum_valid_temperature_c: 0.0,
                 maximum_valid_temperature_c: 110.0,
                 maximum_valid_rpm: 20_000,
             },
-            presets: BTreeMap::from([(
-                "Quiet".into(),
-                vec![
-                    CurvePoint {
-                        temperature_c: 45.0,
-                        percent: 0,
-                    },
-                    CurvePoint {
-                        temperature_c: 95.0,
-                        percent: 100,
-                    },
-                ],
-            )]),
+            firmware_curve_sensor: Some("cpu".into()),
         }
     }
 
@@ -608,14 +619,26 @@ mod tests {
         assert!(fan.validate_curve("bad", &descending).is_err());
 
         let mut invalid = devices();
-        invalid[0].fans[0].limits.emergency_handoff_temperature_c = 95.0;
+        invalid[0].fans[0].limits.restart_temperature_c = 95.0;
         assert!(validate_devices(&invalid).is_err());
 
         let mut cannot_stop = example_fan();
         cannot_stop.limits.minimum_percent = 20;
         cannot_stop.limits.minimum_running_percent = 20;
         assert!(cannot_stop
-            .validate_curve("zero is unsupported", &cannot_stop.presets["Quiet"])
+            .validate_curve(
+                "zero is unsupported",
+                &[
+                    CurvePoint {
+                        temperature_c: 45.0,
+                        percent: 0
+                    },
+                    CurvePoint {
+                        temperature_c: 95.0,
+                        percent: 100
+                    }
+                ]
+            )
             .is_err());
 
         let mut invalid_modes = devices();
@@ -654,8 +677,7 @@ mod tests {
         assert_eq!(fan.limits.minimum_running_percent, 10);
         assert_eq!(fan.limits.stop_temperature_c, 42.0);
         assert_eq!(fan.limits.restart_temperature_c, 45.0);
-        assert_eq!(fan.limits.full_speed_temperature_c, 95.0);
-        assert_eq!(fan.limits.emergency_handoff_temperature_c, 98.0);
-        assert_eq!(fan.presets["Quiet"].len(), 7);
+        assert_eq!(FULL_SPEED_TEMPERATURE_C, 95.0);
+        assert_eq!(FIRMWARE_HANDOFF_TEMPERATURE_C, 98.0);
     }
 }

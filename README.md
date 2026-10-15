@@ -53,7 +53,8 @@ Individual interface documentation can be found here:
 * [org.shadowblip.GPU.Card.Connector](./docs/gpu-card-connector.md)
 * [org.shadowblip.Fan](./docs/fan.md)
 * [org.shadowblip.Fan.Device](./docs/fan-device.md)
-* [Fan platform YAML](./docs/fan-platform-yaml.md)
+* [org.shadowblip.Fan.Sensor](./docs/fan-sensor.md)
+* [Fan profiles and platform YAML](./docs/fan-platform-yaml.md)
 * [Fan validation](./docs/fan-validation.md)
 
 ## Usage
@@ -148,8 +149,10 @@ busctl set-property org.shadowblip.PowerStation /org/shadowblip/Performance/CPU/
 ```
 
 
+## Fan control
+
+Fan API **version 2** loads complete YAML or JSON profiles. Fresh service starts, restarts and reboots enter firmware Automatic; applications own saving and reloading profiles. Successful suspend/resume retains the live profile in memory. This replaces the earlier preset/custom-curve API. See [profiles and examples](./docs/fan-platform-yaml.md). D-Bus activation and systemd recovery are included in archive and RPM assets.
+
 ## License
 
 PowerStation is licensed under THE GNU GPLv3+. See LICENSE for details.
-
-The fan API exposes the saved `CustomCurve` independently of a selected preset. D-Bus activation is installed by both archive and RPM packaging, allowing a native client to start the supervised service without a manual setup command.

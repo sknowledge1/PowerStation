@@ -1,46 +1,74 @@
 <?xml version="1.0"?>
-<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
 <node>
-  <interface name="org.freedesktop.DBus.Properties">
-    <method name="Get">
-      <arg name="interface_name" type="s" direction="in"/>
-      <arg name="property_name" type="s" direction="in"/>
-      <arg type="v" direction="out"/>
-    </method>
-    <method name="Set">
-      <arg name="interface_name" type="s" direction="in"/>
-      <arg name="property_name" type="s" direction="in"/>
-      <arg name="value" type="v" direction="in"/>
-    </method>
-    <method name="GetAll">
-      <arg name="interface_name" type="s" direction="in"/>
-      <arg type="a{sv}" direction="out"/>
-    </method>
-    <signal name="PropertiesChanged">
-      <arg name="interface_name" type="s"/>
-      <arg name="changed_properties" type="a{sv}"/>
-      <arg name="invalidated_properties" type="as"/>
-    </signal>
-  </interface>
   <interface name="org.freedesktop.DBus.Introspectable">
     <method name="Introspect">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.freedesktop.DBus.Peer">
     <method name="Ping">
     </method>
     <method name="GetMachineId">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg name="interface_name" type="s" direction="in" />
+      <arg name="property_name" type="s" direction="in" />
+      <arg type="v" direction="out" />
+    </method>
+    <method name="Set">
+      <arg name="interface_name" type="s" direction="in" />
+      <arg name="property_name" type="s" direction="in" />
+      <arg name="value" type="v" direction="in" />
+    </method>
+    <method name="GetAll">
+      <arg name="interface_name" type="s" direction="in" />
+      <arg type="a{sv}" direction="out" />
+    </method>
+    <signal name="PropertiesChanged">
+      <arg name="interface_name" type="s" />
+      <arg name="changed_properties" type="a{sv}" />
+      <arg name="invalidated_properties" type="as" />
+    </signal>
   </interface>
   <interface name="org.shadowblip.Fan">
     <!--
-     Return fan object paths selected by the platform database; an unsupported system returns an empty list.
+     Load a complete YAML profile by filename in the approved profile directories. A same-name distro file replaces the packaged file. Validate every fan before writing; any application failure returns all affected fans to Automatic.
+     -->
+    <method name="LoadProfile">
+      <arg name="file" type="s" direction="in" />
+    </method>
+    <!--
+     Load the same profile structure as JSON, without saving it. An all-automatic profile works during lifecycle restrictions and without telemetry. Clients own saving and reloading selections after service startup.
+     -->
+    <method name="LoadProfileJson">
+      <arg name="json" type="s" direction="in" />
+    </method>
+    <!--
+     Return the fan object paths for this platform. Unsupported systems return an empty list.
      -->
     <method name="EnumerateFans">
-      <arg type="ao" direction="out"/>
+      <arg type="ao" direction="out" />
     </method>
+    <!--
+     Return stable, platform-selected temperature sensor objects. Profiles reference their Id properties.
+     -->
+    <method name="EnumerateSensors">
+      <arg type="ao" direction="out" />
+    </method>
+    <!--
+     Version 2 replaces the preset/custom-curve API with complete profiles.
+     -->
+    <property name="ApiVersion" type="u" access="read" />
+    <!--
+     Active profile name, including during successful suspend. Empty after startup or a controller fault.
+     -->
+    <property name="CurrentProfileName" type="s" access="read" />
+    <!--
+     Resolved profile file path. Empty for JSON profiles, startup, or a controller fault.
+     -->
+    <property name="CurrentProfilePath" type="s" access="read" />
   </interface>
 </node>

@@ -1,15 +1,17 @@
 # Fan validation
 
-The fan subsystem implements issue [#29](https://github.com/ShadowBlip/PowerStation/issues/29):
-software curves for PWM-only devices and reviewed hardware auto-point curves.
-The AYANEO entry is an initial platform proposal. Importing another daemon's
-saved state is deferred so this change owns only PowerStation configuration.
+Fan API v2 implements [#29](https://github.com/ShadowBlip/PowerStation/issues/29)
+with editable profiles and a separate trusted hardware database. Its software
+validation gate permits updating PR #54. Physical acceptance and qualified
+packages/images remain separate release gates.
 
-## Reproducible checks
+## Reproducible software checks
 
-Use the repository's Rust 1.88 Linux Docker environment for formatting, locked
-tests, release builds, and distribution checks. Install the Rust `rustfmt` and
-`clippy` components in that environment for the corresponding checks.
+Use the repository's Rust 1.88 Linux Dockerfile. It includes formatting/Clippy,
+native and aarch64 libudev development files, and target-specific pkg-config
+paths. Keep build output and Cargo home isolated; builds use the existing lock.
+The only lockfile change for v2 adds the already-locked `serde_json` to the root
+package's direct dependencies; no locked package versions change.
 
 ```sh
 cargo fmt --all -- --check
@@ -17,76 +19,101 @@ cargo test --locked --all
 cargo clippy --locked --all-targets -- -D warnings -A clippy::uninlined_format_args -A clippy::nonminimal_bool
 cargo build --release --locked --target x86_64-unknown-linux-gnu
 cargo build --release --locked --target aarch64-unknown-linux-gnu
-make dist TARGET_ARCH=x86_64-unknown-linux-gnu
-make dist TARGET_ARCH=aarch64-unknown-linux-gnu
+make dist-archive TARGET_ARCH=x86_64-unknown-linux-gnu
+make dist-archive TARGET_ARCH=aarch64-unknown-linux-gnu
+cargo install cargo-generate-rpm --version 0.21.0 --locked
+cargo generate-rpm --target x86_64-unknown-linux-gnu
+cargo generate-rpm --target aarch64-unknown-linux-gnu
 ```
 
-The two Clippy allowances concern existing upstream code, not fan code.
-Do not add new occurrences under those allowances. Check that both archives and
-RPMs include the fan YAML and that build commands leave Cargo.lock unchanged.
+The two Clippy allowances concern existing upstream code. Inspect each archive
+and RPM for the correct ELF/RPM architecture, exact payload bytes and paths,
+0755 binary and 0644 configuration/unit/activation assets. Both formats must
+contain the trusted AYANEO database and `/usr/powerstation/platform/fan_curves/quiet.yaml`.
 
-Run the checked-in lifecycle harness on Linux with a working user systemd
-manager, `dbus-daemon`, `busctl`, Python 3, and the native binary's runtime
-libraries installed:
+**ARM RPM dependency qualification is pending.** Cross-generating an ARM RPM on
+an x86 host does not reliably discover its direct runtime-library dependencies.
+Correct architecture and payload checks are not dependency/install qualification.
+Do not publish these candidates as qualified releases. Distro-native dependency,
+installation and official image testing remain required.
+
+Run the lifecycle harness on Linux with a working user systemd manager,
+`dbus-daemon`, `busctl`, Python 3 and the native binary's runtime libraries:
 
 ```sh
 make in-docker TARGET=test-fan-lifecycle-build
 make test-fan-lifecycle
 ```
 
-The harness creates a private D-Bus daemon, a fake logind fixture, a unique
-transient user service, and temporary fan/DMI/temperature/state files. It copies
-the packaged service properties, redirecting the executable and fan paths.
-It checks custom-call rejection during suspend, path renumbering, sensor loss,
-clean stop/restart, SIGKILL, SIGSTOP/watchdog recovery, logind owner loss, bounded
-failed handoff, and malformed YAML. The fixture models a 250 ms inhibitor
-deadline; it never requests host suspend or writes real fan controls. Cleanup
-stops only its transient unit and fixture processes. GitHub Actions runs this
-harness in a separate Linux job.
+It uses fake DMI/sysfs, a private bus/logind fixture and a unique transient user
+service with the packaged supervision settings. It never requests host suspend
+or touches actual fan controls. It checks profile rejection, live profile
+retention, queued-request protection, fresh resume discovery, sensor loss,
+Automatic without telemetry, clean/crash/watchdog restarts in Automatic even
+with valid or malformed legacy saved state, logind owner loss, bounded failed
+handoff and malformed hardware configuration. It also compares all three custom
+live D-Bus interfaces with checked-in XML while checking that the standard
+interfaces remain available at runtime. The logind fixture rejects unrelated
+`GetAll` while allowing the individual `InhibitDelayMaxUSec` read.
 
-These checks validate software behavior against simulated files and signals.
-They do not reproduce electrical faults, firmware timing, thermal response,
-real kernel suspend, or the physical behavior of a hardware fan curve.
+To regenerate fan bindings without accessing real hardware:
 
-## AYANEO driver evidence
+```sh
+python3 tests/fan_lifecycle.py path/to/powerstation path/to/fan_test_logind --write-bindings
+```
 
-The Linux [`ayaneo-ec` driver at 2643187](https://github.com/torvalds/linux/blob/2643187ccb8628144246ee9d44da5e3ac428f9c3/drivers/platform/x86/ayaneo-ec.c)
-matches board vendor `AYANEO` and board name `AYANEO 3`, registers hwmon
-`ayaneo_ec`, and exposes one PWM/fan channel. Its platform driver is `ayaneo-ec`.
-Sysfs enable value 1 selects manual mode and 2 selects firmware automatic mode.
-PWM writes accept 0–255, convert to integer EC percent, and read back on the
-0–255 scale. That round trip can differ by up to 3 raw PWM units, which explains
-the configured tolerance. The driver's hibernation freeze callback also hands
-manual control back to automatic. PowerStation attempts and verifies its own
-handoff for logind sleep requests before releasing the delay inhibitor.
+Fan Markdown is generated from these bindings with the
+`org.shadowblip.Fan` interface filter in `make docs`. Standard D-Bus boilerplate
+is omitted from fan documentation.
 
-This source inspection is separate from device validation. The original
-physical report did not retain a kernel version or complete raw DMI/driver dump.
-Record `uname -r`, `lscpu`, `udevadm info -a /sys/class/dmi/id`, the driver link,
-hwmon name, sensor labels, and mode/PWM readbacks with each future hardware test.
+Unit tests additionally cover YAML/JSON equivalence, whole-file overrides,
+invalid/oversized input, sensor selection independent of required safety sensors,
+native point counts/sensor binding/running floor, conversion/readback tolerances,
+stalls, native full-speed override, complete-profile validation and multi-fan
+rollback. These simulations do not validate electrical behavior, firmware timing,
+real kernel suspend, or thermal response. Exact tested commit, test counts and
+artifact hashes are recorded in the PR validation report.
 
-## Proposed policy and physical coverage
+## AYANEO evidence and remaining gates
 
-| Setting | Basis and remaining evidence |
+The pinned Linux [`ayaneo-ec` source at 2643187](https://github.com/torvalds/linux/blob/2643187ccb8628144246ee9d44da5e3ac428f9c3/drivers/platform/x86/ayaneo-ec.c)
+provides the board match, hwmon/driver names and enable values. PWM 0–255 maps to
+integer EC percentages, explaining the three-unit raw readback tolerance kept
+inside the trusted controller. The service also uses a reviewed write order.
+Future device records must capture kernel, DMI, driver, sensor labels and actual
+readbacks rather than infer physical support from schema matching.
+
+Historical results at `e6baca4e9ef4a04df2884b8803a6ca6deb167ec0` cover 8840U
+Quiet/Manual and automatic recovery. Manual 20% read `pwm1=51`, 1502 RPM; one
+Quiet sample at 49.625°C read `pwm1=25`, 1061 RPM. Those are individual samples.
+
+The later **255e6805347d605a13106d711c5e565495985633** device record, reconciled
+with `Ayaneo3-Part2/STATUS.md`, used AYANEO 3 8840U / BIOS 1.00 on official
+Bazzite 44.20261012.1, kernel 7.2.9-ogc3.1.fc44.x86_64. It includes real
+s2idle suspend/resume, reboot, clean-stop D-Bus activation, SIGKILL/watchdog and
+sensor-fault recovery through a temporary service binary/platform namespace.
+
+An **uninterrupted five-minute CPU-only Quiet test at unchanged 9 W** passed
+with **352 samples and a 64.000°C peak**. All 16 stress-ng workers completed;
+cooldown ended in verified firmware Automatic. A scoped inhibitor and sleep-gap
+guard protected continuity, and power/thermal settings matched before and after.
+The earlier interrupted attempt remains separate evidence.
+
+These results belong to **255e680**, whose daemon persisted selections and
+exposed API v1. They are **not device validation of API v2 or its startup policy**.
+No new device testing is claimed for this revision. Existing client code,
+including Decky, is outside this revision and requires separate API migration.
+
+| Release gate | Status |
 | --- | --- |
-| 0% while cool; 42 C stop and 45 C restart | Proposed software policy with a 3 C hysteresis band; covered by fake-sysfs regressions. |
-| 10% running floor | The historical 8840U Quiet sample showed `pwm1=25` and 1061 RPM at 49.625 C. This establishes one operating sample, not all thermal/load conditions. |
-| 95 C full speed; 98 C firmware handoff | Proposed control thresholds: full speed precedes handoff by 3 C. They are not vendor-certified thermal limits and have not been validated by a sustained thermal test. |
-| Seven-point Quiet preset | Proposed interpolation policy; the sampled Quiet behavior does not validate the complete curve. |
+| Revised-code device startup/restart/suspend/fault behavior | Pending new device testing |
+| Full operating-range response, running floor and fan-stop hysteresis | Pending physical acceptance |
+| Provisional 95°C full speed / 98°C firmware handoff | Pending thermal policy acceptance; handoff transfers responsibility, not proof of stronger cooling |
+| HX 370 AYANEO variant | Pending device validation |
+| Native hardware curves | Simulated coverage only; no packaged platform advertises them |
+| ARM RPM dependency/install qualification | Pending distro-native qualification |
+| Official testing/stable packages and clean official-image installation | Pending; private namespace testing does not satisfy this gate |
 
-Historical physical validation used the 8840U AYANEO 3 at
-`e6baca4e9ef4a04df2884b8803a6ca6deb167ec0`: Quiet/manual control, SIGKILL/watchdog
-recovery, and clean-stop automatic restoration were reported passing. Manual 20%
-read back as `pwm1=51` at 1502 RPM. Those results belong to that build.
-Current automated checks do not constitute a new physical test.
-
-The YAML matches product or board identity across CPU variants. The HX 370
-variant remains untested hardware; schema/DMI coverage is not physical support
-validation. No packaged platform currently validates native hardware curves.
-Future entries must establish their driver's sensor mapping and mode semantics
-as well as native point counts, running floor, and thermal behavior.
-
-Logind delay inhibitors are bounded and released on process death, as described
-in [systemd's inhibitor documentation](https://systemd.io/INHIBITOR_LOCKS/).
-Automatic recovery can fail when kernel/firmware writes fail; watchdog cleanup
-does not make that handoff an unconditional prerequisite for suspend.
+[Logind delay inhibitors](https://systemd.io/INHIBITOR_LOCKS/) are bounded and
+close on process death. Firmware writes can fail or block, so watchdog recovery
+cannot guarantee a completed handoff before every sleep.

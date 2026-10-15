@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the real daemon and systemd recovery using only fake fan files."""
 import argparse
+import json
+import xml.etree.ElementTree as ET
 import os
 from pathlib import Path
 import shlex
@@ -14,6 +16,9 @@ import uuid
 BUS = "org.shadowblip.PowerStation"
 FAN = "/org/shadowblip/Performance/Fan/Fan0"
 INTERFACE = "org.shadowblip.Fan.Device"
+COLLECTION = "/org/shadowblip/Performance/Fan"
+SENSOR = FAN + "/Sensor0"
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
 LOGIN = "org.freedesktop.login1"
 LOGIN_PATH = "/org/freedesktop/login1"
 CONTROL = "org.shadowblip.Fan.TestLogind"
@@ -67,11 +72,22 @@ class Harness:
     def bus(self, *arguments, check=True):
         return run("busctl", "--address", self.address, "--timeout=1", *arguments, check=check)
 
-    def get(self, name):
-        return shlex.split(self.bus("get-property", BUS, FAN, INTERFACE, name).stdout)[1]
+    def get(self, name, path=FAN, interface=INTERFACE):
+        return shlex.split(self.bus("get-property", BUS, path, interface, name).stdout)[1]
+
+    def current_profile(self):
+        return self.get("CurrentProfileName", COLLECTION, "org.shadowblip.Fan")
+
+    def profile(self, mode, percent=None, check=True):
+        fan = {"fan": "ayaneo-3/system", "mode": mode}
+        if percent is not None:
+            fan["percent"] = percent
+        if mode == "software_curve":
+            fan.update(sensors=["ayaneo-3/system/cpu"], curve=[[45, 0], [95, 100]])
+        return self.call("LoadProfileJson", "s", json.dumps({"name": "Live", "fans": [fan]}), check=check)
 
     def call(self, name, signature=None, *arguments, check=True):
-        args = ["call", BUS, FAN, INTERFACE, name]
+        args = ["call", BUS, COLLECTION, "org.shadowblip.Fan", name]
         if signature is not None:
             args += [signature, *arguments]
         return self.bus(*args, check=check)
@@ -93,6 +109,14 @@ class Harness:
 
     def setup(self):
         self.platform.mkdir()
+        self.profiles = self.root / "profiles"
+        self.overrides = self.root / "overrides"
+        self.profiles.mkdir()
+        self.overrides.mkdir()
+        shutil.copyfile(SOURCE_ROOT / "rootfs/usr/powerstation/platform/fan_curves/quiet.yaml", self.profiles / "quiet.yaml")
+        self.state.parent.mkdir()
+        self.legacy = "schema_version: 1\nfans: {ayaneo-3/system: {mode: manual, manual_percent: 20}}\n"
+        self.state.write_text(self.legacy)
         source = Path(__file__).resolve().parents[1] / "rootfs/usr/share/powerstation/platform/fan-ayaneo-3.yaml"
         self.configuration = self.platform / source.name
         shutil.copyfile(source, self.configuration)
@@ -154,10 +178,12 @@ class Harness:
             f"--setenv=DBUS_SYSTEM_BUS_ADDRESS={self.address}",
             f"--setenv=POWERSTATION_FAN_PLATFORM_DIR={self.platform}",
             f"--setenv=POWERSTATION_FAN_SYSFS_ROOT={self.sysfs}",
-            f"--setenv=POWERSTATION_FAN_STATE_PATH={self.state}", str(self.binary), check=check)
+            f"--setenv=POWERSTATION_FAN_STATE_PATH={self.state}",
+            f"--setenv=POWERSTATION_FAN_PROFILE_DIR={self.profiles}",
+            f"--setenv=POWERSTATION_FAN_PROFILE_OVERRIDE_DIR={self.overrides}", str(self.binary), check=check)
 
     def ready(self):
-        wait(lambda: self.get("TelemetryValid") == "true", "validated fan telemetry")
+        wait(lambda: self.get("TelemetryValid", SENSOR, "org.shadowblip.Fan.Sensor") == "true", "validated fan telemetry")
 
     def mode(self, expected):
         wait(lambda: self.get("Mode") == expected, f"fan mode {expected}")
@@ -171,28 +197,64 @@ class Harness:
             wait(outcome.exists, "inhibitor release or expiry", timeout=5)
             return outcome.read_text()
 
-    def exercise(self):
-        self.check(self.get("Mode") == "automatic", "first use must be automatic")
-        self.call("ApplyPreset", "s", "Quiet")
-        self.check(self.get("Mode") == "preset", "Quiet selects preset mode")
-        self.check(int(self.get("EffectivePercent")) == 10, "Quiet uses the running floor")
-        self.call("SetManual", "y", "20")
-        self.check((self.fan / "pwm1").read_text() == "51", "manual PWM must be verified")
-        print("PASS initial Automatic, Quiet, and Manual", flush=True)
+    def check_bindings(self, write=False):
+        def contract(raw, name):
+            interface = ET.fromstring(raw).find(f"interface[@name='{name}']")
+            assert interface is not None
+            return {kind: sorted((node.attrib['name'], tuple(sorted(node.attrib.items())),
+                                  tuple(tuple(sorted(arg.attrib.items())) for arg in node.findall('arg')))
+                                 for node in interface.findall(kind))
+                    for kind in ('method', 'property', 'signal')}
 
-        saved = self.state.read_text()
-        self.check(self.prepare(True) == "released", "successful handoff releases the inhibitor")
-        self.check((self.fan / "pwm1_enable").read_text() == "2", "suspend hands control to firmware")
-        self.check(self.get("Suspended") == "true", "suspend state is exposed")
-        self.check(self.get("TelemetryValid") == "false", "suspended telemetry is invalid")
-        for name, signature, args in [
-            ("SetManual", "y", ["50"]),
-            ("SetCurve", "a(dy)", ["2", "45", "0", "95", "100"]),
-            ("ApplyPreset", "s", ["Quiet"]),
+        for path, name, filename in [
+            (COLLECTION, "org.shadowblip.Fan", "org-shadowblip-fan.xml"),
+            (FAN, INTERFACE, "org-shadowblip-fan-device.xml"),
+            (SENSOR, "org.shadowblip.Fan.Sensor", "org-shadowblip-fan-sensor.xml"),
         ]:
-            self.check(self.call(name, signature, *args, check=False).returncode != 0,
-                       f"{name} must reject suspended custom control")
-        self.check(self.state.read_text() == saved, "rejected calls preserve saved state")
+            live = self.bus("introspect", BUS, path, "--xml-interface").stdout
+            self.check(all(interface in live for interface in ["org.freedesktop.DBus.Properties", "org.freedesktop.DBus.Introspectable", "org.freedesktop.DBus.Peer"]), f"standard D-Bus interfaces remain on {name}")
+            binding = SOURCE_ROOT / "bindings/dbus-xml" / filename
+            if write:
+                # Keep zbus documentation comments, remove variable child paths,
+                # and sort interfaces so regeneration has a stable ordering.
+                parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+                node = ET.fromstring(live, parser=parser)
+                for child in list(node):
+                    if child.tag == "node":
+                        node.remove(child)
+                node[:] = sorted(node, key=lambda child: child.attrib.get("name", ""))
+                ET.indent(node, space="  ")
+                binding.write_text('<?xml version="1.0"?>\n' + ET.tostring(node, encoding="unicode") + '\n')
+            self.check(contract(live, name) == contract(binding.read_text(), name), f"live {name} signatures match checked-in XML")
+
+    def exercise(self):
+        self.check(self.get("ApiVersion", COLLECTION, "org.shadowblip.Fan") == "2", "API v2")
+        self.check(self.get("Mode") == "automatic", "fresh start ignores stale Manual")
+        self.check(self.current_profile() == "", "startup has no selected profile")
+        self.call("LoadProfile", "s", "quiet.yaml")
+        self.check(self.get("Mode") == "software_curve", "Quiet selects software curve")
+        self.check(int(self.get("Percent")) == 10, "Quiet uses running floor")
+        self.profile("manual", 20)
+        self.check((self.fan / "pwm1").read_text() == "51", "manual percentage converted internally")
+        self.check(self.state.read_text() == self.legacy, "profile loads leave legacy state untouched")
+        for raw in [
+            {"name": "Bad", "fans": [{"fan": "ayaneo-3/system", "mode": "manual", "percent": 101}]},
+            {"name": "Bad", "fans": [{"fan": "unknown", "mode": "automatic"}]},
+            {"name": "Bad", "fans": [{"fan": "ayaneo-3/system", "mode": "software_curve", "sensors": ["unknown"], "curve": [[45, 0], [95, 100]]}]},
+        ]:
+            self.check(self.call("LoadProfileJson", "s", json.dumps(raw), check=False).returncode != 0, "invalid profile rejected")
+        self.check(self.get("Mode") == "manual" and (self.fan / "pwm1").read_text() == "51", "invalid requests preserve active profile and hardware")
+        print("PASS profiles, percentages and invalid requests", flush=True)
+
+        self.check(self.prepare(True) == "released", "successful handoff releases inhibitor")
+        self.check((self.fan / "pwm1_enable").read_text() == "2", "suspend hands control to firmware")
+        self.check(self.get("Mode") == "automatic", "current hardware mode is automatic during sleep")
+        self.check(self.current_profile() == "Live", "live profile retained during sleep")
+        self.check(self.get("TelemetryValid", SENSOR, "org.shadowblip.Fan.Sensor") == "false", "suspended sensor reading invalid")
+        self.check(self.get("PercentValid") == "false", "suspended duty unavailable")
+        self.check(self.profile("manual", 50, check=False).returncode != 0, "suspended Manual rejected")
+        self.check(self.profile("software_curve", check=False).returncode != 0, "suspended curve rejected")
+        self.check(self.call("LoadProfile", "s", "quiet.yaml", check=False).returncode != 0, "suspended file load rejected")
         new_fan = self.fan.with_name("hwmon7")
         self.fan.rename(new_fan)
         self.fan = new_fan
@@ -202,66 +264,82 @@ class Harness:
         self.prepare(False)
         self.ready()
         self.mode("manual")
-        self.check((self.fan / "pwm1_enable").read_text() == "1", "resume restores control at rediscovered paths")
-        print("PASS suspend guards and resume with renumbered paths", flush=True)
+        self.check((self.fan / "pwm1_enable").read_text() == "1", "resume restores live selection at rediscovered paths")
+        self.check(self.current_profile() == "Live", "resume preserves profile identity")
+        print("PASS suspend guards, live profile and fresh resume discovery", flush=True)
 
         self.sensor.unlink()
-        wait(lambda: self.get("TelemetryValid") == "false", "sensor loss invalidation")
+        wait(lambda: self.get("TelemetryValid", SENSOR, "org.shadowblip.Fan.Sensor") == "false", "sensor loss invalidation")
         self.mode("automatic")
-        self.check(self.get("Fault") != "", "sensor loss reports a fault")
-        self.check(self.get("EffectivePercent") == "-1", "fault duty must be unavailable")
-        self.call("SetAutomatic")
-        self.check(self.get("AutomaticVerified") == "true", "Automatic works without telemetry")
+        self.check(self.get("Fault") != "", "sensor loss reports fault")
+        self.check(self.get("PercentValid") == "false", "fault duty unavailable")
+        self.check(self.current_profile() == "", "fault clears current profile identity")
+        self.profile("automatic")
+        self.check((self.fan / "pwm1_enable").read_text() == "2", "Automatic works without telemetry")
         self.sensor.write_text("50000\n")
         self.ready()
-        print("PASS sensor loss and telemetry recovery", flush=True)
+        print("PASS sensor loss, Automatic and telemetry recovery", flush=True)
 
-        self.call("SetManual", "y", "20")
-        self.systemctl("stop")
-        self.check((self.fan / "pwm1_enable").read_text() == "2", "clean stop restores automatic")
-        self.start_service()
+        self.call("LoadProfile", "s", "quiet.yaml")
+        self.prepare(True)
+        self.profile("automatic")
+        self.check(self.profile("manual", 50, check=False).returncode != 0, "custom remains gated after suspended Automatic")
+        self.prepare(False)
         self.ready()
-        self.mode("manual")
-        self.check((self.fan / "pwm1_enable").read_text() == "1", "clean restart restores PowerStation's saved selection")
-        print("PASS clean stop and saved-state restart", flush=True)
+        self.mode("automatic")
+        self.check((self.fan / "pwm1_enable").read_text() == "2", "Automatic during suspend cancels live custom restoration")
+
+        for legacy in [self.legacy, "not: [valid\n"]:
+            self.profile("manual", 20)
+            self.systemctl("stop")
+            self.check((self.fan / "pwm1_enable").read_text() == "2", "clean stop restores firmware")
+            self.state.write_text(legacy)
+            self.start_service()
+            self.ready()
+            self.mode("automatic")
+            self.check((self.fan / "pwm1_enable").read_text() == "2", "clean restart ignores valid or malformed legacy state")
+            self.check(self.state.read_text() == legacy, "legacy file unchanged on clean restart")
+        self.legacy = self.state.read_text()
+        self.state.parent.chmod(0o500)
+        try:
+            self.profile("manual", 50)
+            self.check(self.get("Mode") == "manual", "unwritable legacy state cannot fail profile load")
+        finally:
+            self.state.parent.chmod(0o700)
+        print("PASS clean restarts and ignored legacy persistence", flush=True)
 
         for name, signum in [("SIGKILL", signal.SIGKILL), ("SIGSTOP/watchdog", signal.SIGSTOP)]:
-            self.call("SetManual", "y", "20")
+            self.profile("manual", 20)
             old_pid = self.pid()
             os.kill(old_pid, signum)
             wait(lambda: self.pid() not in (0, old_pid), f"restart after {name}")
             self.ready()
             self.mode("automatic")
-            self.check((self.fan / "pwm1_enable").read_text() == "2", f"{name} recovery restores automatic")
-            self.check("mode: automatic" in self.state.read_text(), f"{name} persists Automatic")
+            self.check((self.fan / "pwm1_enable").read_text() == "2", f"{name} returns to firmware")
+            self.check(self.state.read_text() == self.legacy, f"{name} leaves malformed legacy state untouched")
+            self.check(self.current_profile() == "", f"{name} does not replay profile")
             print(f"PASS {name} recovery", flush=True)
 
-        self.call("SetManual", "y", "20")
+        self.profile("manual", 20)
         self.login_process.terminate()
         self.login_process.wait(timeout=5)
         wait(lambda: (self.fan / "pwm1_enable").read_text() == "2", "fallback after logind owner loss")
-        # Firmware recovery precedes the atomic state-file update. Observe
-        # both outcomes instead of racing persistence after the sysfs write.
-        wait(lambda: "mode: automatic" in self.state.read_text(), "saved Automatic after logind owner loss")
-        self.check("mode: automatic" in self.state.read_text(), "owner loss persists Automatic")
+        self.check(self.state.read_text() == self.legacy, "owner-loss recovery leaves legacy state untouched")
         self.systemctl("stop", check=False)
         self.login_process = self.start_logind()
-        self.systemctl("reset-failed", check=False)
         self.start_service()
         self.ready()
         print("PASS logind owner loss", flush=True)
 
-        self.call("SetManual", "y", "20")
+        self.profile("manual", 20)
         enable = self.fan / "pwm1_enable"
         enable.unlink()
         enable.mkdir()
         self.check(self.prepare(True) in ("released", "expired"), "failed handoff cannot indefinitely delay sleep")
-        result = self.call("SetManual", "y", "50", check=False)
-        self.check(result.returncode != 0, "failed handoff must not admit custom control")
+        self.check(self.profile("manual", 50, check=False).returncode != 0, "failed handoff rejects custom control")
         enable.rmdir()
         enable.write_text("2\n")
         self.systemctl("stop", check=False)
-        self.systemctl("reset-failed", check=False)
         self.prepare(False)
         self.start_service()
         self.ready()
@@ -270,13 +348,11 @@ class Harness:
         self.systemctl("stop")
         self.configuration.write_text("not: [valid\n")
         self.start_service(check=False)
-        wait(lambda: self.systemctl("show", "--property=ExecMainStatus", "--value").stdout.strip() == "1",
-             "malformed YAML startup failure")
-        self.check(self.call("SetManual", "y", "50", check=False).returncode != 0,
-                   "malformed configuration must not expose a healthy fan service")
+        wait(lambda: self.systemctl("show", "--property=ExecMainStatus", "--value").stdout.strip() == "1", "malformed hardware YAML startup failure")
+        self.check(self.profile("manual", 50, check=False).returncode != 0, "malformed hardware configuration cannot expose healthy service")
         self.systemctl("stop", check=False)
         self.configuration.write_text(self.original_yaml)
-        print("PASS malformed configuration rejection", flush=True)
+        print("PASS malformed hardware configuration rejection", flush=True)
         print(f"PASS lifecycle harness: {self.assertions} assertions", flush=True)
 
     def close(self):
@@ -299,6 +375,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=lambda value: Path(value).resolve())
     parser.add_argument("logind", type=lambda value: Path(value).resolve())
+    parser.add_argument("--write-bindings", action="store_true", help="regenerate fan XML from the isolated running service")
     arguments = parser.parse_args()
     for command in ("systemd-run", "systemctl", "busctl", "dbus-daemon"):
         if shutil.which(command) is None:
@@ -311,6 +388,7 @@ def main():
         harness = Harness(Path(directory), arguments.binary, arguments.logind)
         try:
             harness.setup()
+            harness.check_bindings(write=arguments.write_bindings)
             harness.exercise()
         except Exception:
             if harness.started:

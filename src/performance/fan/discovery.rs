@@ -50,7 +50,7 @@ pub struct FanPaths {
     pub pwm: PathBuf,
     pub enable: PathBuf,
     pub rpm: PathBuf,
-    pub temperature_inputs: Vec<PathBuf>,
+    pub temperature_inputs: BTreeMap<String, PathBuf>,
     pub backend: BackendKind,
 }
 
@@ -142,8 +142,8 @@ fn read_hwmon_entries(root: &Path) -> Result<Vec<PathBuf>, DiscoveryError> {
 fn discover_temperatures(
     entries: &[PathBuf],
     sources: &[TemperatureSource],
-) -> Result<Vec<PathBuf>, DiscoveryError> {
-    let mut inputs = Vec::new();
+) -> Result<BTreeMap<String, PathBuf>, DiscoveryError> {
+    let mut inputs = BTreeMap::new();
     for source in sources {
         let mut matches = Vec::new();
         for path in entries {
@@ -177,6 +177,9 @@ fn discover_temperatures(
                 if read_trimmed(entry.path()).as_deref() != Some(source.label.as_str()) {
                     continue;
                 }
+                if !path.join(format!("temp{number}_input")).exists() {
+                    continue;
+                }
                 let input = checked_attribute(
                     &canonical_or_original(path),
                     &format!("temp{number}_input"),
@@ -186,21 +189,19 @@ fn discover_temperatures(
         }
         matches.sort();
         matches.dedup();
-        if matches.is_empty() && !source.required {
+        if matches.is_empty() {
             continue;
         }
-        inputs.push(exactly_one(
-            matches,
-            &format!(
-                "temperature hwmon name={} label={}",
-                source.hwmon_name, source.label
-            ),
-        )?);
-    }
-    if inputs.is_empty() {
-        return Err(DiscoveryError(
-            "no configured temperature source was discovered".into(),
-        ));
+        inputs.insert(
+            source.id.clone(),
+            exactly_one(
+                matches,
+                &format!(
+                    "temperature hwmon name={} label={}",
+                    source.hwmon_name, source.label
+                ),
+            )?,
+        );
     }
     Ok(inputs)
 }
@@ -295,49 +296,26 @@ fn select_backend(
             "hardware curve backend requires at least two complete auto points".into(),
         ));
     }
-    match (config.backend, auto_points) {
-        (BackendPreference::SoftwareCurve, _) => Ok(BackendKind::SoftwareCurve),
-        (BackendPreference::HardwareCurve, None) => Err(DiscoveryError(
-            "hardware curve backend requested but no auto-point attributes exist".into(),
-        )),
-        (BackendPreference::HardwareCurve, Some(points)) => {
-            hardware_policy_supported(config, points.len())?;
-            Ok(BackendKind::HardwareCurve(points))
-        }
-        (BackendPreference::Auto, Some(points)) => {
-            if let Err(reason) = hardware_policy_supported(config, points.len()) {
-                log::debug!("Fan {} uses software curves: {reason}", config.id);
-                return Ok(BackendKind::SoftwareCurve);
-            }
-            Ok(BackendKind::HardwareCurve(points))
-        }
-        (BackendPreference::Auto, None) => Ok(BackendKind::SoftwareCurve),
-    }
-}
-
-fn hardware_policy_supported(config: &FanConfig, point_count: usize) -> Result<(), DiscoveryError> {
-    if config.mode_values.hardware_curve.is_none() {
-        return Err(DiscoveryError(
-            "no hardware curve enable value is configured".into(),
-        ));
-    }
-    // A continuously interpolated hardware curve cannot express the software
-    // controller's fan-stop hysteresis or its jump to the running floor.
-    if config.limits.minimum_percent < config.limits.minimum_running_percent {
-        return Err(DiscoveryError(
-            "hardware curves require a nonzero minimum at or above the running floor; use software curves for fan-stop hysteresis".into(),
-        ));
-    }
-    if config
-        .presets
-        .values()
-        .any(|points| points.len() != point_count)
+    if config.backend == BackendPreference::HardwareCurve
+        && (auto_points.is_none()
+            || config.mode_values.hardware_curve.is_none()
+            || config.firmware_curve_sensor.is_none())
     {
-        return Err(DiscoveryError(format!(
-            "hardware presets must contain exactly {point_count} points"
-        )));
+        return Err(DiscoveryError(
+            "native curve requested without complete attributes and a trusted sensor binding"
+                .into(),
+        ));
     }
-    Ok(())
+    match auto_points {
+        Some(points)
+            if config.backend != BackendPreference::SoftwareCurve
+                && config.mode_values.hardware_curve.is_some()
+                && config.firmware_curve_sensor.is_some() =>
+        {
+            Ok(BackendKind::HardwareCurve(points))
+        }
+        _ => Ok(BackendKind::SoftwareCurve),
+    }
 }
 
 fn driver_name(hwmon: &Path) -> Option<String> {
@@ -418,7 +396,6 @@ fn read_trimmed(path: PathBuf) -> Option<String> {
 mod tests {
     use super::*;
     use crate::performance::fan::config::{FanLimits, HwmonSelector, ManualWriteOrder, ModeValues};
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -458,6 +435,8 @@ mod tests {
                 channel: 1,
             },
             temperature_sources: vec![TemperatureSource {
+                id: "cpu".into(),
+                name: "CPU".into(),
                 hwmon_name: "k10temp".into(),
                 label: "Tctl".into(),
                 required: true,
@@ -479,13 +458,11 @@ mod tests {
                 restart_temperature_c: 45.0,
                 stall_rpm: 100,
                 stall_grace_seconds: 3,
-                full_speed_temperature_c: 95.0,
-                emergency_handoff_temperature_c: 98.0,
                 minimum_valid_temperature_c: 0.0,
                 maximum_valid_temperature_c: 110.0,
                 maximum_valid_rpm: 20_000,
             },
-            presets: BTreeMap::new(),
+            firmware_curve_sensor: Some("cpu".into()),
         }
     }
 
@@ -568,58 +545,6 @@ mod tests {
         let paths = discover_fan(tree.path(), &config).unwrap();
         assert_eq!(paths.backend.curve_point_count(), 3);
         assert_eq!(paths.backend.name(), "hardware_curve");
-    }
-
-    #[test]
-    fn auto_falls_back_for_unsupported_policy_and_explicit_hardware_rejects_it() {
-        let points = vec![
-            HardwareCurvePointPaths {
-                index: 1,
-                temperature: "temp1".into(),
-                pwm: "pwm1".into(),
-            },
-            HardwareCurvePointPaths {
-                index: 2,
-                temperature: "temp2".into(),
-                pwm: "pwm2".into(),
-            },
-        ];
-        let mut config = config();
-        assert_eq!(
-            select_backend(&config, Some(points.clone())).unwrap(),
-            BackendKind::SoftwareCurve
-        );
-        config.backend = BackendPreference::HardwareCurve;
-        assert!(select_backend(&config, Some(points.clone())).is_err());
-        config.backend = BackendPreference::Auto;
-        config.limits.minimum_percent = 10;
-        config.presets.insert(
-            "Quiet".into(),
-            vec![
-                super::super::config::CurvePoint {
-                    temperature_c: 45.0,
-                    percent: 10,
-                },
-                super::super::config::CurvePoint {
-                    temperature_c: 70.0,
-                    percent: 30,
-                },
-                super::super::config::CurvePoint {
-                    temperature_c: 95.0,
-                    percent: 100,
-                },
-            ],
-        );
-        assert_eq!(
-            select_backend(&config, Some(points.clone())).unwrap(),
-            BackendKind::SoftwareCurve
-        );
-        config.presets.clear();
-        config.mode_values.hardware_curve = None;
-        assert_eq!(
-            select_backend(&config, Some(points)).unwrap(),
-            BackendKind::SoftwareCurve
-        );
     }
 
     #[test]

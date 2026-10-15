@@ -3,6 +3,6 @@ pub mod controller;
 pub mod dbus;
 pub mod discovery;
 pub mod manager;
-pub mod persistence;
+pub mod profile;
 
 pub use manager::FanManager;
