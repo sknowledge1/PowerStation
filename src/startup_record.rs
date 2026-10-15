@@ -61,6 +61,21 @@ fn checked_record(file: &mut File, boot_id: &str, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
+fn read_existing(directory: &File, name: &CString, boot_id: &str, uid: u32) -> io::Result<()> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut existing = unsafe { File::from_raw_fd(descriptor) };
+    checked_record(&mut existing, boot_id, uid)
+}
+
 fn record_first(path: &Path, boot_id: &str, invocation_id: &str, uid: u32) -> io::Result<()> {
     if !valid_boot(boot_id) || !valid_hex(invocation_id, 32) {
         return Err(invalid("invalid boot or systemd invocation identity"));
@@ -82,8 +97,38 @@ fn record_first(path: &Path, boot_id: &str, invocation_id: &str, uid: u32) -> io
             .as_encoded_bytes(),
     )
     .map_err(|_| invalid("invalid record name"))?;
-    // Exclusive creation is the durable first-attempt fence. A partial record is
-    // deliberately retained: replacing it could make a later invocation look first.
+    // Fence the attempt before creating the record. Even failure to create the
+    // file must not let a later invocation promote itself to first.
+    let claim_name = CString::new([name.as_bytes(), b".attempt"].concat())
+        .map_err(|_| invalid("invalid attempt name"))?;
+    let first = unsafe { libc::mkdirat(directory.as_raw_fd(), claim_name.as_ptr(), 0o700) } == 0;
+    if !first {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let claim_descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            claim_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if claim_descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let claim = unsafe { File::from_raw_fd(claim_descriptor) };
+    let metadata = claim.metadata()?;
+    if metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(invalid("untrusted fan startup attempt"));
+    }
+    claim.sync_all()?;
+    directory.sync_all()?;
+    if !first {
+        return read_existing(&directory, &name, boot_id, uid);
+    }
+    // A partial record or existing failure fence is deliberately retained.
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -97,18 +142,7 @@ fn record_first(path: &Path, boot_id: &str, invocation_id: &str, uid: u32) -> io
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(error);
         }
-        let descriptor = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut existing = unsafe { File::from_raw_fd(descriptor) };
-        return checked_record(&mut existing, boot_id, uid);
+        return read_existing(&directory, &name, boot_id, uid);
     }
     let mut file = unsafe { File::from_raw_fd(descriptor) };
     let record = Record {
@@ -196,6 +230,21 @@ mod tests {
             assert!(fixture.record(SECOND).is_err());
             assert_eq!(std::fs::read(fixture.path()).unwrap(), bytes);
         }
+    }
+    #[test]
+    fn failed_record_creation_cannot_promote_a_later_invocation() {
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.path()).unwrap();
+        assert!(fixture.record(FIRST).is_err());
+        std::fs::remove_dir(fixture.path()).unwrap();
+        assert!(fixture.record(SECOND).is_err());
+        assert!(!fixture.path().exists());
+        let claim = fixture.0.join("first.json.attempt");
+        assert_eq!(std::fs::metadata(&claim).unwrap().mode() & 0o777, 0o700);
+        std::fs::remove_dir(&claim).unwrap();
+        symlink(&fixture.0, &claim).unwrap();
+        assert!(fixture.record(SECOND).is_err());
+        assert!(!fixture.path().exists());
     }
     #[test]
     fn missing_directory_or_invalid_identity_cannot_create_a_record() {

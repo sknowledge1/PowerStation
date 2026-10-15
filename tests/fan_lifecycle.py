@@ -375,6 +375,13 @@ class Harness:
         self.check(self.profile("manual", 50, check=False).returncode != 0, "unrecorded startup never exposes fan controls")
         self.check((self.fan / "pwm1_enable").read_text() == "2", "startup-record failure retains Automatic cleanup")
         self.systemctl("stop", check=False)
+        self.startup_record.unlink()
+        self.systemctl("reset-failed", check=False)
+        self.start_service(check=False)
+        wait(lambda: self.systemctl("show", "--property=Result", "--value").stdout.strip() == "exit-code", "missing fenced startup evidence rejection")
+        self.check(not self.startup_record.exists(), "a fenced failed creation cannot become first later")
+        self.check(self.profile("manual", 50, check=False).returncode != 0, "missing fenced evidence never exposes fan controls")
+        self.systemctl("stop", check=False)
         print("PASS first-invocation evidence and corrupt startup rejection", flush=True)
         print(f"PASS lifecycle harness: {self.assertions} assertions", flush=True)
 
