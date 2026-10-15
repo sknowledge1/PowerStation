@@ -7,7 +7,7 @@ packages/images remain separate release gates.
 
 ## Reproducible software checks
 
-The packaged startup safeguard is documented in [fan-startup.md](fan-startup.md). Include its mandatory pre-start command and preserved private runtime directory in package inspection. Lifecycle checks additionally verify the actual first invocation, record preservation through clean/crash/watchdog restart and corrupt-record rejection before service exposure. These checks do not change fan API v2 or qualify physical boot restoration.
+The packaged startup safeguard and additive API v2 startup contract are documented in [fan-startup.md](fan-startup.md). Include its mandatory pre-start command and preserved private runtime directory in package inspection. Lifecycle checks additionally verify the actual first invocation, read-only startup status, locked startup-profile rejection after another selection, record preservation through clean/crash/watchdog restart and corrupt-record rejection before service exposure. These simulations do not qualify physical boot restoration on revised code.
 
 Use the repository's Rust 1.88 Linux Dockerfile. It includes formatting/Clippy,
 native and aarch64 libudev development files, and target-specific pkg-config
@@ -103,15 +103,27 @@ The earlier interrupted attempt remains separate evidence.
 
 These results belong to **255e680**, whose daemon persisted selections and
 exposed API v1. They are **not device validation of API v2 or its startup policy**.
-No new device testing is claimed for this revision. Existing client code,
-including Decky, is outside this revision and requires separate API migration.
+The later API v2 build **1b7330eadb17620cec1870539817fcb928942c4c** has separate
+private 8840U evidence: attended fan modes, real normal-boot restoration,
+crash-before-first-client refusal, native restart/SIGKILL and sensor-fault
+recovery, suspend/resume and rollback. Its uninterrupted five-minute, 16-thread
+CPU-only Quiet observation at unchanged 9 W records **342 samples and a 65.5°C
+peak**, followed by native Automatic cleanup. Those API v2 results do not
+replace or relabel the 255e680 record. They use private native binaries and
+overrides, not qualified official package delivery.
+
+Decky's separate API v2 migration and private acceptance are complete.
+OpenGamepadUI's separate client revision uses the additive startup-status and
+guarded startup-load methods. No physical test of these new methods or the
+revised native/OpenGamepadUI heads is claimed. Godot/native integration against
+a private bus and fake sysfs is software evidence only.
 
 | Release gate | Status |
 | --- | --- |
 | Revised-code device startup/restart/suspend/fault behavior | Pending new device testing |
 | Full operating-range response, running floor and fan-stop hysteresis | Pending physical acceptance |
 | Provisional 95°C full speed / 98°C firmware handoff | Pending thermal policy acceptance; handoff transfers responsibility, not proof of stronger cooling |
-| HX 370 AYANEO variant | Pending device validation |
+| HX 370 AYANEO variant | Compatibility assumed from shared interfaces and 8840U results; not separately physically tested |
 | Native hardware curves | Simulated coverage only; no packaged platform advertises them |
 | ARM RPM dependency/install qualification | Pending distro-native qualification |
 | Official testing/stable packages and clean official-image installation | Pending; private namespace testing does not satisfy this gate |

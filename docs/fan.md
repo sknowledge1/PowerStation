@@ -20,7 +20,7 @@ Load a complete YAML profile by filename in the approved profile directories. A 
 
 | Name | Direction | Type | Description |
 | --- | :---: | :---: | --- |
-| **file** | *in* | *s* | |
+| **file** | *in* | *s* |  |
 
 #### LoadProfileJson
 
@@ -30,7 +30,7 @@ Load the same profile structure as JSON, without saving it. An all-automatic pro
 
 | Name | Direction | Type | Description |
 | --- | :---: | :---: | --- |
-| **json** | *in* | *s* | |
+| **json** | *in* | *s* |  |
 
 #### EnumerateFans
 
@@ -40,7 +40,7 @@ Return the fan object paths for this platform. Unsupported systems return an emp
 
 | Name | Direction | Type | Description |
 | --- | :---: | :---: | --- |
-| \*\*\*\* | *out* | *ao* | |
+| \*\*\*\* | *out* | *ao* |  |
 
 #### EnumerateSensors
 
@@ -50,6 +50,42 @@ Return stable, platform-selected temperature sensor objects. Profiles reference 
 
 | Name | Direction | Type | Description |
 | --- | :---: | :---: | --- |
-| \*\*\*\* | *out* | *ao* | |
+| \*\*\*\* | *out* | *ao* |  |
+
+#### GetStartupStatus
+
+Read-only boot ID, current systemd invocation ID, and startup-restoration eligibility. Eligibility requires valid private first-invocation evidence, protected lifecycle, healthy telemetry, no fault and no selected profile. Invalid or unmanaged evidence returns empty identities and false. Clients must pin the unique bus owner and durably consume their boot attempt before loading a saved profile; this method grants no ownership or write privilege.
+
+##### Arguments
+
+| Name | Direction | Type | Description |
+| --- | :---: | :---: | --- |
+| **boot\_id** | *out* | *s* |  |
+| **invocation\_id** | *out* | *s* |  |
+| **eligible** | *out* | *b* |  |
+
+#### LoadStartupProfileJson
+
+Load a saved JSON profile only on the identified first managed invocation while fans remain healthy, untouched and lifecycle-protected. Recheck identity and eligibility under the complete profile transaction lock; reject stale startup status without writing. Clients must still consume their own boot attempt before calling. Uses the same profile validation, access policy and rollback as LoadProfileJson.
+
+##### Arguments
+
+| Name | Direction | Type | Description |
+| --- | :---: | :---: | --- |
+| **boot\_id** | *in* | *s* |  |
+| **invocation\_id** | *in* | *s* |  |
+| **json** | *in* | *s* |  |
+
+#### LoadStartupProfile
+
+Load a profile file on an eligible first managed invocation, using the same locked startup checks as LoadStartupProfileJson and the same approved directories and whole-file overrides as LoadProfile.
+
+##### Arguments
+
+| Name | Direction | Type | Description |
+| --- | :---: | :---: | --- |
+| **boot\_id** | *in* | *s* |  |
+| **invocation\_id** | *in* | *s* |  |
+| **file** | *in* | *s* |  |
 
 ### Signals

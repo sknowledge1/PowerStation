@@ -90,6 +90,12 @@ starts in **firmware Automatic**. Applications own saving profiles and deciding
 when to reload them. The daemon neither reads nor writes legacy
 `/var/lib/powerstation/fan-state.yaml`; existing files are left untouched.
 
+Unprivileged applications can use the additive startup-status and guarded
+startup-load methods described in [fan-startup.md](fan-startup.md). These keep
+the recorder private and recheck first-invocation eligibility under the profile
+transaction lock. A regular profile load must not emulate automatic restoration
+from a previously read status value.
+
 Successful suspend/resume retains only the live profile in memory. Before sleep,
 the service blocks custom requests, including requests already queued on a fan
 lock, and verifies a firmware handoff under logind's delay inhibitor. Resume

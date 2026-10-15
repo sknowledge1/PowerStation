@@ -10,8 +10,44 @@ Missing directories, symlinks, insecure ownership/modes, stale boot identity, ma
 
 Before opening the first record for creation, the helper exclusively creates and syncs root-owned 0700 `first.json.attempt`. An existing attempt requires a valid existing record; a missing record is a failed attempt and is never created later. This preserves the failure fence even when record-file creation itself fails. Existing valid first records remain unchanged during an in-boot package upgrade.
 
-A restoring client must validate the root-owned record, compare both boot and current systemd InvocationID, bind the service's unique bus owner Unix PID to MainPID, and confirm fresh healthy telemetry, no fault and no active profile. Consume the client-side boot attempt durably before sending; uncertainty, a changed owner or invalid evidence forbids automatic replay. This record is evidence, not a new writer or a change to D-Bus API v2. Profile validation and native Automatic recovery remain authoritative.
+A restoring client must validate the root-owned record, compare both boot and current systemd InvocationID, bind the service's unique bus owner Unix PID to MainPID, and confirm fresh healthy telemetry, no fault and no active profile. Consume the client-side boot attempt durably before sending; uncertainty, a changed owner or invalid evidence forbids automatic replay. This record is evidence. Profile validation and native Automatic recovery remain authoritative.
 
 The helper's `POWERSTATION_FAN_STARTUP_PATH` environment override exists for trusted service configuration and isolated tests, like the existing fake platform/sysfs paths. The private lifecycle harness uses its unique transient unit's runtime directory and actual invocation IDs. A directly executed daemon is not proof of managed first startup and cannot qualify guarded boot restoration.
 
 Tests cover first/later invocations, private permissions, corrupt/interrupted records, wrong identity, symlinks, hard links, nonregular files and bounded reads. The real systemd lifecycle fixture verifies preservation across clean/crash/watchdog restarts and failure before D-Bus exposure with corrupt evidence. No fixture result substitutes for physical fan acceptance.
+
+## Unprivileged client contract
+
+API v2 adds `GetStartupStatus() -> (boot_id, invocation_id, eligible)`. It exposes
+only the current boot/invocation identity and eligibility, leaving both recorder
+paths private. Missing, corrupt, untrusted or unmanaged evidence produces empty
+identities and false. A later managed invocation reports its current identity
+but is never eligible. Status reads never create or repair evidence and write
+no hardware. Eligibility additionally requires protected lifecycle, healthy
+telemetry, verified Automatic on every fan, no fault and no selected profile.
+
+A read alone cannot close the race between checking eligibility and writing a
+profile. `LoadStartupProfile(boot_id, invocation_id, file)` and
+`LoadStartupProfileJson(boot_id, invocation_id, json)` therefore recheck those
+identities and eligibility while holding the existing whole-profile transaction
+and controller locks. Stale status, another client's selection (including an
+explicit Automatic profile), faults, suspend restrictions and later invocations
+are rejected without writing. These methods use the same approved directories,
+profile validation, rollback and D-Bus caller policy as ordinary loads; they add
+no ownership claim or privilege. API version remains 2: the unmerged v2 proposal
+gains these additive methods, and clients requiring guarded restoration must
+require them rather than emulate them with an ordinary load.
+
+An unprivileged client pins the unique owner for status/loads, compares the
+reported boot with the kernel boot UUID and durably consumes its own per-user
+boot attempt before reading preferences or calling a startup load. It must
+never automatically retry uncertainty or consume a fresh attempt on service
+recovery. The native locked guard is authoritative across clients; preferences
+and per-user fences are not privileged ownership. A successful startup load
+also prevents another client from automatically replacing that profile.
+
+Existing privileged clients may keep validating the private record directly.
+The new contract does not change record permissions, service supervision,
+fresh-process Automatic behavior or the native live suspend/resume handoff.
+Simulated coverage of the additive methods is separate from all physical
+results recorded against earlier heads.

@@ -65,6 +65,49 @@ impl FanBus {
             .collect()
     }
 
+    /// Read-only boot ID, current systemd invocation ID, and startup-restoration eligibility. Eligibility requires valid private first-invocation evidence, protected lifecycle, healthy telemetry, no fault and no selected profile. Invalid or unmanaged evidence returns empty identities and false. Clients must pin the unique bus owner and durably consume their boot attempt before loading a saved profile; this method grants no ownership or write privilege.
+    #[zbus(out_args("boot_id", "invocation_id", "eligible"))]
+    pub async fn get_startup_status(&self) -> (String, String, bool) {
+        let (boot, invocation, first) = crate::startup_record::service_status();
+        (
+            boot,
+            invocation,
+            first && self.manager.startup_restore_ready().await,
+        )
+    }
+
+    /// Load a saved JSON profile only on the identified first managed invocation while fans remain healthy, untouched and lifecycle-protected. Recheck identity and eligibility under the complete profile transaction lock; reject stale startup status without writing. Clients must still consume their own boot attempt before calling. Uses the same profile validation, access policy and rollback as LoadProfileJson.
+    pub async fn load_startup_profile_json(
+        &self,
+        boot_id: &str,
+        invocation_id: &str,
+        json: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let result = self
+            .manager
+            .load_startup_profile_json(boot_id, invocation_id, json)
+            .await;
+        self.manager.emit_changes(connection).await;
+        result.map_err(|error| fdo::Error::Failed(error.to_string()))
+    }
+
+    /// Load a profile file on an eligible first managed invocation, using the same locked startup checks as LoadStartupProfileJson and the same approved directories and whole-file overrides as LoadProfile.
+    pub async fn load_startup_profile(
+        &self,
+        boot_id: &str,
+        invocation_id: &str,
+        file: &str,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let result = self
+            .manager
+            .load_startup_profile_file(boot_id, invocation_id, file)
+            .await;
+        self.manager.emit_changes(connection).await;
+        result.map_err(|error| fdo::Error::Failed(error.to_string()))
+    }
+
     /// Version 2 replaces the preset/custom-curve API with complete profiles.
     #[zbus(property)]
     pub fn api_version(&self) -> u32 {

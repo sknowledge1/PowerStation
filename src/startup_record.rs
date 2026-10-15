@@ -38,7 +38,7 @@ fn valid_boot(value: &str) -> bool {
         && valid_hex(&value.replace('-', ""), 32)
 }
 
-fn checked_record(file: &mut File, boot_id: &str, uid: u32) -> io::Result<()> {
+fn checked_record(file: &mut File, boot_id: &str, uid: u32) -> io::Result<Record> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != uid
@@ -58,10 +58,10 @@ fn checked_record(file: &mut File, boot_id: &str, uid: u32) -> io::Result<()> {
     if record.version != 1 || record.boot_id != boot_id || !valid_hex(&record.invocation_id, 32) {
         return Err(invalid("fan startup record is not valid for this boot"));
     }
-    Ok(())
+    Ok(record)
 }
 
-fn read_existing(directory: &File, name: &CString, boot_id: &str, uid: u32) -> io::Result<()> {
+fn read_existing(directory: &File, name: &CString, boot_id: &str, uid: u32) -> io::Result<Record> {
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -126,7 +126,7 @@ fn record_first(path: &Path, boot_id: &str, invocation_id: &str, uid: u32) -> io
     claim.sync_all()?;
     directory.sync_all()?;
     if !first {
-        return read_existing(&directory, &name, boot_id, uid);
+        return read_existing(&directory, &name, boot_id, uid).map(|_| ());
     }
     // A partial record or existing failure fence is deliberately retained.
     let descriptor = unsafe {
@@ -142,7 +142,7 @@ fn record_first(path: &Path, boot_id: &str, invocation_id: &str, uid: u32) -> io
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(error);
         }
-        return read_existing(&directory, &name, boot_id, uid);
+        return read_existing(&directory, &name, boot_id, uid).map(|_| ());
     }
     let mut file = unsafe { File::from_raw_fd(descriptor) };
     let record = Record {
@@ -166,6 +166,70 @@ pub fn record_service_start() -> Result<(), Box<dyn std::error::Error>> {
         libc::geteuid()
     })?;
     Ok(())
+}
+
+fn startup_status(
+    path: &Path,
+    boot_id: &str,
+    invocation_id: &str,
+    uid: u32,
+) -> io::Result<(String, String, bool)> {
+    if !valid_boot(boot_id) || !valid_hex(invocation_id, 32) {
+        return Err(invalid("invalid current startup identity"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("missing startup directory"))?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(invalid("untrusted fan startup directory"));
+    }
+    let name = CString::new(
+        path.file_name()
+            .ok_or_else(|| invalid("missing record name"))?
+            .as_encoded_bytes(),
+    )
+    .map_err(|_| invalid("invalid record name"))?;
+    let claim_name = CString::new([name.as_bytes(), b".attempt"].concat()).unwrap();
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            claim_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let claim = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = claim.metadata()?;
+    if metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(invalid("untrusted fan startup attempt"));
+    }
+    let record = read_existing(&directory, &name, boot_id, uid)?;
+    Ok((
+        boot_id.into(),
+        invocation_id.into(),
+        record.invocation_id == invocation_id,
+    ))
+}
+
+/// Read-only evidence for unprivileged clients. Never create or repair a record.
+pub fn service_status() -> (String, String, bool) {
+    let result = (|| {
+        let path = std::env::var_os("POWERSTATION_FAN_STARTUP_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(RECORD_PATH));
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let invocation =
+            std::env::var("INVOCATION_ID").map_err(|_| invalid("unmanaged invocation"))?;
+        startup_status(&path, boot.trim(), &invocation, unsafe { libc::geteuid() })
+    })();
+    result.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -320,5 +384,42 @@ mod tests {
             assert!(fixture.record(SECOND).is_err());
             assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn status_identifies_first_and_later_invocations_without_writes() {
+        let fixture = Fixture::new();
+        fixture.record(FIRST).unwrap();
+        let original = std::fs::read(fixture.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            startup_status(&fixture.path(), BOOT, FIRST, uid).unwrap(),
+            (BOOT.into(), FIRST.into(), true)
+        );
+        assert_eq!(
+            startup_status(&fixture.path(), BOOT, SECOND, uid).unwrap(),
+            (BOOT.into(), SECOND.into(), false)
+        );
+        assert_eq!(std::fs::read(fixture.path()).unwrap(), original);
+    }
+
+    #[test]
+    fn status_fails_closed_for_missing_corrupt_or_untrusted_evidence() {
+        let fixture = Fixture::new();
+        let uid = unsafe { libc::geteuid() };
+        assert!(startup_status(&fixture.path(), BOOT, FIRST, uid).is_err());
+        assert!(!fixture.path().exists());
+        fixture.record(FIRST).unwrap();
+        for (boot, invocation, owner) in
+            [("bad", FIRST, uid), (BOOT, "", uid), (BOOT, FIRST, uid + 1)]
+        {
+            assert!(startup_status(&fixture.path(), boot, invocation, owner).is_err());
+        }
+        std::fs::write(fixture.path(), "{").unwrap();
+        assert!(startup_status(&fixture.path(), BOOT, FIRST, uid).is_err());
+        assert_eq!(std::fs::read_to_string(fixture.path()).unwrap(), "{");
+        std::fs::remove_file(fixture.path()).unwrap();
+        assert!(startup_status(&fixture.path(), BOOT, FIRST, uid).is_err());
+        assert!(!fixture.path().exists());
     }
 }

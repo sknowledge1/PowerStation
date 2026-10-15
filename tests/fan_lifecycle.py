@@ -80,6 +80,10 @@ class Harness:
     def current_profile(self):
         return self.get("CurrentProfileName", COLLECTION, "org.shadowblip.Fan")
 
+    def startup_status(self):
+        return json.loads(self.bus("--json=short", "call", BUS, COLLECTION,
+                                   "org.shadowblip.Fan", "GetStartupStatus").stdout)["data"]
+
     def profile(self, mode, percent=None, check=True):
         fan = {"fan": "ayaneo-3/system", "mode": mode}
         if percent is not None:
@@ -243,7 +247,16 @@ class Harness:
         self.check(self.get("ApiVersion", COLLECTION, "org.shadowblip.Fan") == "2", "API v2")
         self.check(self.get("Mode") == "automatic", "fresh start ignores stale Manual")
         self.check(self.current_profile() == "", "startup has no selected profile")
-        self.call("LoadProfile", "s", "quiet.yaml")
+        boot, invocation, eligible = self.startup_status()
+        self.check(eligible and boot == evidence["boot_id"] and invocation == evidence["invocation_id"], "unprivileged startup status identifies eligible first managed invocation")
+        self.check(self.startup_record.read_bytes() == first_record, "startup status is read only")
+        self.check(self.call("LoadStartupProfile", "sss", boot, "0" * 32, "quiet.yaml", check=False).returncode != 0, "wrong startup invocation is rejected before writes")
+        self.check(self.get("Mode") == "automatic", "rejected startup identity leaves Automatic")
+        self.call("LoadStartupProfile", "sss", boot, invocation, "quiet.yaml")
+        self.check(not self.startup_status()[2], "a selected profile consumes native startup eligibility")
+        self.check(self.call("LoadStartupProfileJson", "sss", boot, invocation,
+                             json.dumps({"name": "Replay", "fans": [{"fan": "ayaneo-3/system", "mode": "manual", "percent": 60}]}), check=False).returncode != 0,
+                   "stale eligible status cannot replay a profile after another request")
         self.check(self.get("Mode") == "software_curve", "Quiet selects software curve")
         self.check(int(self.get("Percent")) == 10, "Quiet uses running floor")
         self.profile("manual", 20)
@@ -311,6 +324,7 @@ class Harness:
             self.mode("automatic")
             self.check(self.startup_record.read_bytes() == first_record, "clean stop/start preserves first invocation evidence")
             self.check(evidence["invocation_id"] != self.systemctl("show", "--property=InvocationID", "--value").stdout.strip(), "a later managed invocation cannot appear first")
+            self.check(not self.startup_status()[2], "clean restart cannot qualify automatic client restoration")
             self.check((self.fan / "pwm1_enable").read_text() == "2", "clean restart ignores valid or malformed legacy state")
             self.check(self.state.read_text() == legacy, "legacy file unchanged on clean restart")
         self.legacy = self.state.read_text()
@@ -333,6 +347,7 @@ class Harness:
             self.check(self.state.read_text() == self.legacy, f"{name} leaves malformed legacy state untouched")
             self.check(self.current_profile() == "", f"{name} does not replay profile")
             self.check(self.startup_record.read_bytes() == first_record, f"{name} preserves the first-invocation record")
+            self.check(not self.startup_status()[2], f"{name} cannot qualify client restoration")
             print(f"PASS {name} recovery", flush=True)
 
         self.profile("manual", 20)

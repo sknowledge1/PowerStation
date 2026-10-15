@@ -59,6 +59,30 @@
       <arg type="ao" direction="out" />
     </method>
     <!--
+     Read-only boot ID, current systemd invocation ID, and startup-restoration eligibility. Eligibility requires valid private first-invocation evidence, protected lifecycle, healthy telemetry, no fault and no selected profile. Invalid or unmanaged evidence returns empty identities and false. Clients must pin the unique bus owner and durably consume their boot attempt before loading a saved profile; this method grants no ownership or write privilege.
+     -->
+    <method name="GetStartupStatus">
+      <arg name="boot_id" type="s" direction="out" />
+      <arg name="invocation_id" type="s" direction="out" />
+      <arg name="eligible" type="b" direction="out" />
+    </method>
+    <!--
+     Load a saved JSON profile only on the identified first managed invocation while fans remain healthy, untouched and lifecycle-protected. Recheck identity and eligibility under the complete profile transaction lock; reject stale startup status without writing. Clients must still consume their own boot attempt before calling. Uses the same profile validation, access policy and rollback as LoadProfileJson.
+     -->
+    <method name="LoadStartupProfileJson">
+      <arg name="boot_id" type="s" direction="in" />
+      <arg name="invocation_id" type="s" direction="in" />
+      <arg name="json" type="s" direction="in" />
+    </method>
+    <!--
+     Load a profile file on an eligible first managed invocation, using the same locked startup checks as LoadStartupProfileJson and the same approved directories and whole-file overrides as LoadProfile.
+     -->
+    <method name="LoadStartupProfile">
+      <arg name="boot_id" type="s" direction="in" />
+      <arg name="invocation_id" type="s" direction="in" />
+      <arg name="file" type="s" direction="in" />
+    </method>
+    <!--
      Version 2 replaces the preset/custom-curve API with complete profiles.
      -->
     <property name="ApiVersion" type="u" access="read" />
